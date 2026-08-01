@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  ArrowLeft,
   Download,
   Eraser,
   Hand,
@@ -46,12 +45,78 @@ export default function EditorPage({ user, onLogout }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const { data: projectsData } = useQuery({
     queryKey: ['projects'],
     queryFn: () => api.listProjects(),
     enabled: !!projectId,
   });
+
+  // -------------------------------------------------------------------------
+  // Job polling (shared by segment + edit)
+  // -------------------------------------------------------------------------
+  const pollJob = useCallback(
+    (jobId: string, type: 'segment' | 'edit') => {
+      const started = Date.now();
+      const tick = async () => {
+        try {
+          const { job } = await api.job(jobId);
+          if (job.status === 'succeeded') {
+            if (type === 'segment') {
+              editor.setJob({ kind: 'done', type, jobId });
+              editor.setMask(job.outputUrl ?? null);
+            } else {
+              editor.setJob({ kind: 'done', type, jobId });
+              if (job.outputUrl) {
+                editor.pushHistory(editor.imageUrl ?? '');
+                editor.setImage({
+                  url: job.outputUrl,
+                  id: editor.imageId ?? '',
+                  width: editor.imageWidth,
+                  height: editor.imageHeight,
+                  name: editor.imageName,
+                });
+                void canvasRef.current?.setBaseImage(job.outputUrl);
+              }
+            }
+            setBusy(false);
+            return;
+          }
+          if (job.status === 'failed' || job.status === 'canceled') {
+            editor.setJob({ kind: 'error', message: job.error ?? 'Job failed' });
+            setError(job.error ?? 'Job failed');
+            setBusy(false);
+            return;
+          }
+          editor.setJob({
+            kind: 'running',
+            type,
+            stage: job.stage ?? 'working',
+            progress: job.progress,
+            jobId,
+          });
+          if (Date.now() - started < 5 * 60 * 1000) {
+            pollRef.current = setTimeout(tick, JOB_POLL_INTERVAL_MS);
+          } else {
+            editor.setJob({ kind: 'error', message: 'Timed out waiting for the job' });
+            setBusy(false);
+          }
+        } catch (err) {
+          editor.setJob({ kind: 'error', message: (err as Error).message });
+          setBusy(false);
+        }
+      };
+      void tick();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // Cleanup timer on unmount
+  useEffect(() => () => {
+    if (pollRef.current) clearTimeout(pollRef.current);
+  }, []);
 
   // -------------------------------------------------------------------------
   // Canvas lifecycle
@@ -65,17 +130,21 @@ export default function EditorPage({ user, onLogout }: Props) {
       onHintChange: (hint) => {
         editor.setHint(hint);
         if (hint) {
-          // Instant local mask preview for brush/box (before SAM refines it)
           const preview = rasterizeHint(hint, { width: 256, height: 256 });
           editor.setMask(null, maskToDataUrl(featherMask(preview, 256, 256, 2), 256, 256));
         } else {
           editor.setMask(null, null);
         }
       },
+      onStrokeEnd: () => {
+        // Magic select auto-runs SAM when the user finishes a stroke
+        if (editor.tool === 'magic' && editor.imageId && editor.hint) {
+          void runMagicSelect();
+        }
+      },
     });
     canvasRef.current = canvas;
 
-    // load image if store already has one (e.g. after project open)
     if (editor.imageUrl) {
       void canvas.setBaseImage(editor.imageUrl);
     }
@@ -86,12 +155,10 @@ export default function EditorPage({ user, onLogout }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Apply tool to canvas
   useEffect(() => {
     canvasRef.current?.setTool(editor.tool);
   }, [editor.tool]);
 
-  // Apply mask overlay from SAM result
   useEffect(() => {
     if (editor.maskUrl) {
       void canvasRef.current?.setMaskOverlay(editor.maskUrl);
@@ -100,7 +167,6 @@ export default function EditorPage({ user, onLogout }: Props) {
     }
   }, [editor.maskUrl, editor.maskDataUrl]);
 
-  // Apply new base image (accepted edit / upload / restore)
   useEffect(() => {
     if (editor.imageUrl) {
       void canvasRef.current?.setBaseImage(editor.imageUrl);
@@ -161,10 +227,9 @@ export default function EditorPage({ user, onLogout }: Props) {
   // -------------------------------------------------------------------------
   async function runGenerate() {
     if (!editor.imageId || !editor.prompt.trim()) {
-      setError('Draw a selection and describe the change first');
+      setError('Describe the change first');
       return;
     }
-    // Build mask payload: prefer SAM mask URL, else the local rasterized hint
     let maskPayload: string;
     if (editor.maskUrl) {
       maskPayload = editor.maskUrl;
@@ -174,7 +239,6 @@ export default function EditorPage({ user, onLogout }: Props) {
       const preview = rasterizeHint(editor.hint, { width: 512, height: 512 });
       maskPayload = maskToDataUrl(featherMask(preview, 512, 512, 4), 512, 512);
     } else {
-      // Expand/relight without selection: full-image mask
       const full = new Uint8ClampedArray(512 * 512 * 4).fill(255);
       maskPayload = maskToDataUrl(full, 512, 512);
     }
@@ -198,74 +262,7 @@ export default function EditorPage({ user, onLogout }: Props) {
   }
 
   // -------------------------------------------------------------------------
-  // Job polling
-  // -------------------------------------------------------------------------
-  const pollJob = useCallback(
-    (jobId: string, type: 'segment' | 'edit') => {
-      const started = Date.now();
-      const tick = async () => {
-        try {
-          const { job } = await api.job(jobId);
-          if (job.status === 'succeeded') {
-            if (type === 'segment') {
-              const result = job.outputUrl;
-              editor.setJob({ kind: 'done', type, jobId });
-              editor.setMask(result ?? null);
-            } else {
-              editor.setJob({ kind: 'done', type, jobId });
-              if (job.outputUrl) {
-                editor.pushHistory(editor.imageUrl ?? '');
-                editor.setImage({
-                  url: job.outputUrl,
-                  id: editor.imageId ?? '',
-                  width: editor.imageWidth,
-                  height: editor.imageHeight,
-                  name: editor.imageName,
-                });
-                void canvasRef.current?.setBaseImage(job.outputUrl);
-              }
-            }
-            setBusy(false);
-            return;
-          }
-          if (job.status === 'failed') {
-            editor.setJob({ kind: 'error', message: job.error ?? 'Job failed' });
-            setError(job.error ?? 'Job failed');
-            setBusy(false);
-            return;
-          }
-          if (job.status === 'canceled') {
-            editor.setJob({ kind: 'error', message: 'Job canceled' });
-            setBusy(false);
-            return;
-          }
-          // still running
-          editor.setJob({
-            kind: 'running',
-            type,
-            stage: job.stage ?? 'working',
-            progress: job.progress,
-            jobId,
-          });
-          if (Date.now() - started < 5 * 60 * 1000) {
-            setTimeout(tick, JOB_POLL_INTERVAL_MS);
-          } else {
-            editor.setJob({ kind: 'error', message: 'Timed out waiting for the job' });
-            setBusy(false);
-          }
-        } catch (err) {
-          editor.setJob({ kind: 'error', message: (err as Error).message });
-          setBusy(false);
-        }
-      };
-      void tick();
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
-
-  // -------------------------------------------------------------------------
-  // History (undo/redo within session) + project save
+  // History (undo/redo) + project save + export
   // -------------------------------------------------------------------------
   function handleUndo() {
     const prev = editor.undo();
@@ -425,7 +422,6 @@ export default function EditorPage({ user, onLogout }: Props) {
             </div>
           )}
 
-          {/* Job progress overlay */}
           {running && (
             <div className="absolute left-1/2 top-4 w-72 -translate-x-1/2 rounded-xl border border-accent/30 bg-ink-900/90 p-4 shadow-glow backdrop-blur animate-fade-in">
               <div className="mb-1 flex items-center justify-between text-xs">
@@ -435,10 +431,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                 <span className="text-zinc-400">{job.progress}%</span>
               </div>
               <div className="h-1.5 overflow-hidden rounded-full bg-ink-700">
-                <div
-                  className="h-full rounded-full bg-accent transition-all"
-                  style={{ width: `${job.progress}%` }}
-                />
+                <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${job.progress}%` }} />
               </div>
               <p className="mt-1.5 text-[11px] text-zinc-400">{job.stage}</p>
             </div>
@@ -456,7 +449,6 @@ export default function EditorPage({ user, onLogout }: Props) {
 
         {/* Right panel */}
         <aside className="flex w-80 flex-col gap-4 overflow-y-auto border-l border-ink-700 bg-ink-900 p-4">
-          {/* Prompt */}
           <div>
             <label className="mb-1 block text-xs font-medium text-zinc-400">What should AI do?</label>
             <textarea
@@ -486,7 +478,6 @@ export default function EditorPage({ user, onLogout }: Props) {
                 className="flex-1 accent-cyan-400"
               />
             </div>
-            {/* Accept / discard after an edit completes */}
             {job.kind === 'done' && job.type === 'edit' && (
               <div className="mt-2 flex gap-2">
                 <button
@@ -496,7 +487,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                   }}
                   className="flex-1 rounded-lg border border-ink-600 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:border-accent hover:text-accent"
                 >
-                  Keep (auto-accepted)
+                  Keep
                 </button>
                 <button
                   onClick={handleUndo}
@@ -508,7 +499,6 @@ export default function EditorPage({ user, onLogout }: Props) {
             )}
           </div>
 
-          {/* Presets */}
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Quick edits</h3>
             <div className="grid grid-cols-2 gap-2">
@@ -525,7 +515,6 @@ export default function EditorPage({ user, onLogout }: Props) {
             </div>
           </div>
 
-          {/* Projects */}
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Projects</h3>
             {projectsData?.projects.length ? (
