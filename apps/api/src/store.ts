@@ -4,6 +4,11 @@ import { nanoid } from 'nanoid';
 import { config } from './config.js';
 import type { Job, JobResult, Project, ProjectVersion, User } from '@aie/types';
 
+/** User as persisted on disk (passwordHash never leaves the API). */
+export interface StoredUser extends User {
+  passwordHash: string;
+}
+
 /**
  * Minimal JSON-file persistence for Render's persistent disk.
  * Each collection is one JSON file, written atomically.
@@ -31,7 +36,7 @@ class JsonCollection<T extends { id: string }> {
         const rows = JSON.parse(fs.readFileSync(this.file, 'utf-8')) as T[];
         for (const row of rows) map.set(row.id, row);
       } catch {
-        // corrupt file -> start empty (upload a fresh one)
+        // corrupt file -> start empty
       }
     }
     this.cache = map;
@@ -93,7 +98,7 @@ for (const dir of [uploadsDir, masksDir, resultsDir, exportsDir]) ensureDir(dir)
 
 export const dirs = { uploadsDir, masksDir, resultsDir, exportsDir };
 
-export const users = new JsonCollection<User>(path.join(dataDir, 'db'), 'users');
+export const users = new JsonCollection<StoredUser>(path.join(dataDir, 'db'), 'users');
 export const projects = new JsonCollection<Project>(path.join(dataDir, 'db'), 'projects');
 export const versions = new JsonCollection<ProjectVersion>(path.join(dataDir, 'db'), 'versions');
 export const jobs = new JsonCollection<Job>(path.join(dataDir, 'db'), 'jobs');
@@ -133,7 +138,6 @@ export function addVersion(
   };
   versions.insert(version);
 
-  // Clear head flags, set new head
   for (const v of versions.where((v) => v.projectId === projectId)) {
     if (v.id !== version.id && v.isHead) versions.update(v.id, { isHead: false });
   }
@@ -178,6 +182,6 @@ export function completeJob(id: string, result: JobResult): Job | undefined {
     status: 'succeeded',
     progress: 100,
     stage: 'done',
-    outputUrl: 'outputUrl' in result ? result.imageUrl : result.maskUrl,
+    outputUrl: 'imageUrl' in result ? result.imageUrl : result.maskUrl,
   });
 }
