@@ -1,0 +1,5 @@
+modal>=0.64
+fastapi>=0.115
+pillow>=10.4
+numpy>=1.26
+requests>=2.32
