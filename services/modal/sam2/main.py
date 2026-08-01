@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import time
+from typing import Optional
+
+import modal
+
+from shared import (
+    decode_mask,
+    encode_data_url,
+    image_to_png_bytes,
+    load_image,
+    mask_to_png_bytes,
+)
+
+app = modal.App("sam2-segment")
+
+# Model weights are downloaded once to a shared volume and reused across
+# warm containers — GPUs idle-shrink to zero when no requests are in flight.
+volume = modal.Volume.from_name("aie-models", create_if_missing=True)
+
+SAM2_IMAGE = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch>=2.3",
+        "torchvision>=0.18",
+        "opencv-python-headless>=4.9",
+        "pillow>=10.4",
+        "numpy>=1.26",
+        "requests>=2.32",
+    )
+    .apt_install("git")
+    .run_commands(
+        "git clone --depth 1 https://github.com/facebookresearch/sam2.git /root/sam2",
+        "pip install -e /root/sam2",
+    )
+)
+
+
+def download_sam2() -> None:
+    """Fetch SAM 2 checkpoint (and hydra configs) into the shared volume."""
+    import os
+
+    os.makedirs("/models/sam2", exist_ok=True)
+    checkpoint_dir = "/models/sam2"
+    ckpt = os.path.join(checkpoint_dir, "sam2.1_hiera_large.pt")
+    if not os.path.exists(ckpt):
+        # SAM 2.1 large from the official release bucket
+        url = (
+            "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+            "sam2.1_hiera_large.pt"
+        )
+        import urllib.request
+
+        print("[sam2] downloading checkpoint…")
+        urllib.request.urlretrieve(url, ckpt)
+        print("[sam2] checkpoint downloaded")
+
+
+@app.cls(
+    image=SAM2_IMAGE,
+    gpu="A10G",
+    timeout=600,
+    allow_concurrent_inputs=8,
+    volumes={"/models": volume},
+    secrets=[modal.Secret.from_name("hf-token", required=False)],
+)
+class Sam2Service:
+    @modal.enter()
+    def load(self) -> None:
+        import sys
+
+        sys.path.insert(0, "/root/sam2")
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        download_sam2()
+        checkpoint = "/models/sam2/sam2.1_hiera_large.pt"
+        cfg = "sam2.1_hiera_l.yaml"
+        self._model = build_sam2(cfg, checkpoint, device="cuda")
+        self._predictor = SAM2ImagePredictor(self._model)
+        print("[sam2] model loaded")
+
+    @modal.method()
+    def segment(
+        self,
+        image: str | bytes,
+        mode: str = "brush",
+        point: Optional[dict] = None,
+        box: Optional[list] = None,
+        points: Optional[list] = None,
+    ) -> dict:
+        import numpy as np
+        import torch
+
+        started = time.time()
+        img = load_image(image)
+        w, h = img.size
+        arr = np.asarray(img)
+
+        self._predictor.set_image(arr)
+
+        if mode == "point" and point is not None:
+            x = int(point["x"] * w)
+            y = int(point["y"] * h)
+            masks, scores, _ = self._predictor.predict(
+                point_coords=np.array([[x, y]]),
+                point_labels=np.array([1]),
+                multimask_output=True,
+            )
+        elif mode == "box" and box is not None:
+            x0, y0, x1, y1 = box
+            masks, scores, _ = self._predictor.predict(
+                point_coords=None,
+                box=np.array([[x0 * w, y0 * h, x1 * w, y1 * h]]),
+                multimask_output=False,
+            )
+        elif mode == "brush" and points is not None:
+            coords = np.array([[p["x"] * w, p["y"] * h] for p in points])
+            labels = np.ones(len(coords), dtype=np.int32)
+            masks, scores, _ = self._predictor.predict(
+                point_coords=coords,
+                point_labels=labels,
+                multimask_output=True,
+            )
+        else:
+            raise ValueError("Invalid selection mode or missing coordinates")
+
+        # Pick highest-scoring mask
+        best = int(np.argmax(scores))
+        mask = masks[best].astype(np.float32)
+
+        # Feather edges slightly for natural blending
+        mask = _feather(mask, radius=2)
+
+        mask_img = mask_to_png_bytes(mask)
+        return {
+            "maskUrl": encode_data_url(mask_img),
+            "maskWidth": w,
+            "maskHeight": h,
+            "latencyMs": int((time.time() - started) * 1000),
+        }
+
+
+def _feather(mask: np.ndarray, radius: int = 2) -> np.ndarray:
+    import cv2
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    dilated = cv2.dilate(mask, kernel, iterations=1)
+    blurred = cv2.GaussianBlur(dilated, (0, 0), sigmaX=1.0)
+    return blurred
+
+
+@app.function(image=SAM2_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token", required=False)])
+def _warm() -> None:
+    download_sam2()
+
+
+@_warm.local_entrypoint()
+def warm() -> None:
+    """Pre-download model weights: modal run sam2.main:warm"""
+    _warm.remote()
+
+
+@app.function()
+def segment(
+    image: str,
+    mode: str = "brush",
+    point: Optional[dict] = None,
+    box: Optional[list] = None,
+    points: Optional[list] = None,
+) -> dict:
+    """Standalone entry for direct calls: modal run sam2.main:segment …"""
+    svc = Sam2Service()
+    return svc.segment.remote(image, mode, point, box, points)
+
+
+@app.web_endpoint(method="POST")
+def web_segment(image: str, mode: str = "brush", point: Optional[dict] = None, box: Optional[list] = None, points: Optional[list] = None) -> dict:
+    """HTTP endpoint used by the Express API: POST /segment"""
+    svc = Sam2Service()
+    return svc.segment.remote(image, mode, point, box, points)
