@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import io
 import time
 from typing import Optional
 
@@ -56,8 +54,12 @@ class FluxKontext:
     @modal.enter()
     def load(self) -> None:
         import torch
-        from diffusers import FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler, AutoencoderKL
-        from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+        from diffusers import (
+            AutoencoderKL,
+            FlowMatchEulerDiscreteScheduler,
+            FluxPipeline,
+            FluxTransformer2DModel,
+        )
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
         base = "/models/hf/FLUX.1-Kontext-dev"
@@ -85,39 +87,28 @@ class FluxKontext:
 
     @modal.method()
     def edit(self, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> dict:
+        import numpy as np
         import torch
+        from PIL import Image as PILImage
 
         started = time.time()
-        import numpy as np
 
         src = load_image(image)
         src_w, src_h = src.size
 
-        # Load mask at source resolution and resize to model-friendly dims
-        mask_arr = decode_mask(mask, (src_w, src_h))
-
         # Standard FLUX edit sizing (divisible by 16)
-        w = (src_w // 16) * 16
-        h = (src_h // 16) * 16
-        w = max(256, min(1024, w))
-        h = max(256, min(1024, h))
+        w = max(256, min(1024, (src_w // 16) * 16))
+        h = max(256, min(1024, (src_h // 16) * 16))
 
-        src_resized = src.resize((w, h), __import__("PIL").Image.LANCZOS)
-        mask_resized = mask_arr
+        src_resized = src.resize((w, h), PILImage.LANCZOS)
 
-        # Convert mask to 0..1 float and ensure shape matches
-        import numpy as _np
-
-        mask_np = _np.array(mask_resized)
-        # decode_mask already returns 0..1; resize if needed
-        from PIL import Image as _PIL
-
+        # Decode mask (already 0..1 float at source resolution), resize to target
+        mask_np = decode_mask(mask, (src_w, src_h))
         if mask_np.shape != (h, w):
-            mask_img = _PIL.fromarray((mask_np * 255).astype(_np.uint8)).resize((w, h), _PIL.NEAREST)
-            mask_np = _np.asarray(mask_img, dtype=_np.float32) / 255.0
+            mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize((w, h), PILImage.NEAREST)
+            mask_np = np.asarray(mask_img, dtype=np.float32) / 255.0
 
         mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)  # 1,1,h,w
-
         gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
 
         result = self._pipe(
