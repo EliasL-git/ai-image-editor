@@ -4,7 +4,7 @@ import bcrypt from 'bcryptjs';
 import sharp from 'sharp';
 import fs from 'node:fs';
 import path from 'node:path';
-import { config, publicUrl } from './config.js';
+import { config } from './config.js';
 import { requireAuth, signToken, userOf } from './auth.js';
 import {
   addVersion,
@@ -12,15 +12,17 @@ import {
   createJob,
   createProject,
   headVersion,
+  jobs,
   projects,
   updateJob,
   users,
   versions,
+  type StoredUser,
 } from './store.js';
-import { upload, saveUpload, saveMask, saveResult, saveExport, readFileByUrl, fileExists } from './uploads.js';
+import { upload, saveUpload, saveMask, saveResult, saveExport, readFileByUrl } from './uploads.js';
 import { requestSegment, requestEdit } from './modal.js';
 import { isLocalFallback } from './config.js';
-import type { Job, ProjectVersion } from '@aie/types';
+import type { User } from '@aie/types';
 
 const app = express();
 app.use(cors({ origin: config.corsOrigin === '*' ? true : config.corsOrigin }));
@@ -45,6 +47,10 @@ app.get('/health', (_req, res) => {
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
+function publicUser(u: StoredUser): User {
+  return { id: u.id, email: u.email, name: u.name, createdAt: u.createdAt };
+}
+
 app.post('/auth/register', async (req: Request, res: Response) => {
   const { email, password, name } = req.body ?? {};
   if (typeof email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
@@ -66,8 +72,9 @@ app.post('/auth/register', async (req: Request, res: Response) => {
     email: normalized,
     name: typeof name === 'string' && name.trim() ? name.trim() : normalized.split('@')[0],
     createdAt: new Date().toISOString(),
+    passwordHash: hash,
   });
-  res.status(201).json({ token: signToken(user), user });
+  res.status(201).json({ token: signToken(user), user: publicUser(user) });
 });
 
 app.post('/auth/login', async (req: Request, res: Response) => {
@@ -77,11 +84,11 @@ app.post('/auth/login', async (req: Request, res: Response) => {
     return;
   }
   const user = users.find((u) => u.email === email.trim().toLowerCase());
-  if (!user || !(await bcrypt.compare(password, user.passwordHash ?? ''))) {
+  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
     res.status(401).json({ error: 'Invalid email or password' });
     return;
   }
-  res.json({ token: signToken(user), user: { ...user, passwordHash: undefined } });
+  res.json({ token: signToken(user), user: publicUser(user) });
 });
 
 // ---------------------------------------------------------------------------
@@ -119,19 +126,22 @@ app.post('/segment', requireAuth, async (req: Request, res: Response) => {
     input: { imageId, mode, point, box, points },
   });
 
-  // Run in background; client polls GET /jobs/:id
   void (async () => {
     try {
       updateJob(job.id, { status: 'running', progress: 40, stage: 'running SAM 2' });
       const result = await requestSegment({ imageId, mode, point, box, points });
-      // Persist mask from data URL if needed
       let maskUrl = result.maskUrl;
       if (maskUrl.startsWith('data:')) {
         const saved = await saveMask(maskUrl);
         maskUrl = saved.url;
       }
       updateJob(job.id, { stage: 'saving mask' });
-      completeJob(job.id, { maskUrl, maskWidth: result.maskWidth, maskHeight: result.maskHeight, latencyMs: result.latencyMs });
+      completeJob(job.id, {
+        maskUrl,
+        maskWidth: result.maskWidth,
+        maskHeight: result.maskHeight,
+        latencyMs: result.latencyMs,
+      });
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
     }
@@ -159,11 +169,9 @@ app.post('/edit', requireAuth, async (req: Request, res: Response) => {
   void (async () => {
     try {
       updateJob(job.id, { status: 'running', progress: 30, stage: 'starting FLUX Kontext' });
-      // Resolve the source image to a fetchable URL for Modal
       const sourceUrl = await resolveSourceUrl(imageId);
       updateJob(job.id, { progress: 50, stage: 'generating edit' });
       const result = await requestEdit({ imageId, prompt, mask, strength, seed, imageUrl: sourceUrl });
-      // Persist result image if it's a data URL
       let imageUrl = result.imageUrl;
       if (imageUrl.startsWith('data:')) {
         const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
@@ -180,26 +188,23 @@ app.post('/edit', requireAuth, async (req: Request, res: Response) => {
 });
 
 async function resolveSourceUrl(imageId: string): Promise<string> {
-  // imageId is the upload id; find the stored file URL
-  const asset = findUploadById(imageId);
-  if (asset && fileExists(asset)) return publicUrl(`/uploads/${asset}`);
-  return imageId; // allow passing a direct URL as imageId
-}
-
-function findUploadById(imageId: string): string | null {
+  // imageId is an upload id; resolve to a fetchable URL for Modal.
   const uploadsDir = path.join(config.dataDir, 'uploads');
   for (const ext of ['jpg', 'png', 'webp']) {
     const candidate = `${imageId}.${ext}`;
-    if (fs.existsSync(path.join(uploadsDir, candidate))) return candidate;
+    if (fs.existsSync(path.join(uploadsDir, candidate))) {
+      return publicUrl(`/uploads/${candidate}`);
+    }
   }
-  return null;
+  // Allow passing a direct URL as imageId.
+  return imageId;
 }
 
 // ---------------------------------------------------------------------------
 // Jobs polling
 // ---------------------------------------------------------------------------
 app.get('/jobs/:id', requireAuth, (req: Request, res: Response) => {
-  const job = jobsStore().get(req.params.id);
+  const job = jobs.get(req.params.id);
   if (!job) {
     res.status(404).json({ error: 'Job not found' });
     return;
@@ -210,11 +215,6 @@ app.get('/jobs/:id', requireAuth, (req: Request, res: Response) => {
   }
   res.json({ job });
 });
-
-function jobsStore() {
-  // re-exported for handlers that need the raw collection
-  return jobsCollection;
-}
 
 // ---------------------------------------------------------------------------
 // Projects & versions (Git-style history)
@@ -259,7 +259,7 @@ app.get('/projects/:id', requireAuth, (req: Request, res: Response) => {
   res.json({ project: { ...project, versions: vs, headVersionId: headVersion(project.id)?.id ?? null } });
 });
 
-app.post('/projects/:id/versions', requireAuth, async (req: Request, res: Response) => {
+app.post('/projects/:id/versions', requireAuth, (req: Request, res: Response) => {
   const user = userOf(res);
   const project = projects.get(req.params.id);
   if (!project || project.userId !== user.id) {
@@ -314,7 +314,7 @@ app.post('/export', requireAuth, async (req: Request, res: Response) => {
     res.status(404).json({ error: 'Version not found' });
     return;
   }
-  const fmt = ['png', 'jpeg', 'webp'].includes(format) ? format : 'png';
+  const fmt = (['png', 'jpeg', 'webp'].includes(format) ? format : 'png') as 'png' | 'jpeg' | 'webp';
   const q = typeof quality === 'number' ? Math.min(1, Math.max(0.1, quality)) : 0.92;
   const sc = typeof scale === 'number' ? Math.min(4, Math.max(0.1, scale)) : 1;
 
@@ -324,8 +324,11 @@ app.post('/export', requireAuth, async (req: Request, res: Response) => {
     return;
   }
   let out = sharp(buffer);
-  if (sc !== 1) out = out.resize({ width: Math.round((await out.metadata()).width! * sc) });
-  const outBuf = await out.toFormat(fmt as 'png', { quality: Math.round(q * 100) }).toBuffer();
+  if (sc !== 1) {
+    const meta = await out.metadata();
+    out = out.resize({ width: Math.round((meta.width ?? 1024) * sc) });
+  }
+  const outBuf = await out.toFormat(fmt, { quality: Math.round(q * 100) }).toBuffer();
   const url = await saveExport(outBuf, fmt);
   res.json({ url });
 });
@@ -339,14 +342,13 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
-// Import at bottom to avoid circular import with store
-import { jobs as jobsCollection } from './store.js';
-
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 const server = app.listen(config.port, () => {
-  console.log(`[api] listening on port ${config.port} (${config.env}) — modal: ${isLocalFallback() ? 'local fallback' : 'configured'}`);
+  console.log(
+    `[api] listening on port ${config.port} (${config.env}) — modal: ${isLocalFallback() ? 'local fallback' : 'configured'}`,
+  );
 });
 
 export { app, server };
