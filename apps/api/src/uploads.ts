@@ -90,25 +90,33 @@ export function mimeToExt(mime: string): string {
   }
 }
 
-export function fileExists(relativeUrl: string): boolean {
-  const clean = relativeUrl.replace(/^\//, '');
-  const parts = clean.split('/');
-  if (parts.length !== 2) return false;
-  const [kind, name] = parts;
-  const dir = (dirs as Record<string, string>)[`${kind}Dir`];
-  if (!dir) return false;
-  return fs.existsSync(path.join(dir, path.basename(name)));
-}
+const KIND_DIRS: Record<string, string> = {
+  uploads: dirs.uploadsDir,
+  masks: dirs.masksDir,
+  results: dirs.resultsDir,
+  exports: dirs.exportsDir,
+};
 
-export function readFileByUrl(relativeUrl: string): Buffer | null {
-  const clean = relativeUrl.replace(/^\//, '');
+/**
+ * Resolve a stored-asset URL (relative or absolute) to an absolute path.
+ * Returns null for anything that doesn't map to a known kind + filename.
+ */
+export function resolveAssetPath(relativeUrl: string): string | null {
+  const clean = relativeUrl.replace(/^https?:\/\/[^/]+\//, '').replace(/^\//, '');
   const parts = clean.split('/');
   if (parts.length !== 2) return null;
   const [kind, name] = parts;
-  const dir = (dirs as Record<string, string>)[`${kind}Dir`];
+  const dir = KIND_DIRS[kind];
   if (!dir) return null;
-  const abs = path.join(dir, path.basename(name));
-  return fs.existsSync(abs) ? fs.readFileSync(abs) : null;
+  // Guard against traversal
+  if (name.includes('..') || name.includes('/') || name.includes('\\')) return null;
+  const abs = path.join(dir, name);
+  return fs.existsSync(abs) ? abs : null;
+}
+
+export function readFileByUrl(relativeUrl: string): Buffer | null {
+  const abs = resolveAssetPath(relativeUrl);
+  return abs ? fs.readFileSync(abs) : null;
 }
 
 // Multer memory storage with a size guard
