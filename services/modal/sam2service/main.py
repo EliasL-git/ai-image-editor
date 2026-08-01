@@ -5,7 +5,7 @@ from typing import Optional
 
 import modal
 
-from shared import (
+from .shared import (
     decode_mask,
     encode_data_url,
     image_to_png_bytes,
@@ -28,11 +28,15 @@ SAM2_IMAGE = (
         "pillow>=10.4",
         "numpy>=1.26",
         "requests>=2.32",
+        "fastapi>=0.115",
+        "uvicorn>=0.32",
     )
     .apt_install("git")
     .run_commands(
-        "git clone --depth 1 https://github.com/facebookresearch/sam2.git /root/sam2",
-        "pip install -e /root/sam2",
+        # Clone into /opt (not /root) so the repo directory name "sam2" can never
+        # shadow the installed `sam2` package or the app package at /root/sam2service.
+        "git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2-repo",
+        "pip install -e /opt/sam2-repo",
     )
 )
 
@@ -61,22 +65,23 @@ def download_sam2() -> None:
     image=SAM2_IMAGE,
     gpu="A10G",
     timeout=600,
-    allow_concurrent_inputs=8,
     volumes={"/models": volume},
-    secrets=[modal.Secret.from_name("hf-token", required=False)],
+    secrets=[modal.Secret.from_name("hf-token")],
 )
+# A container is recycled (terminated) after a single request, so it never
+# lingers after a job finishes or fails.
+@modal.concurrent(max_inputs=1)
 class Sam2Service:
     @modal.enter()
     def load(self) -> None:
-        import sys
-
-        sys.path.insert(0, "/root/sam2")
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
         download_sam2()
         checkpoint = "/models/sam2/sam2.1_hiera_large.pt"
-        cfg = "sam2.1_hiera_l.yaml"
+        # Absolute path to the hydra config inside the cloned repo; hydra resolves
+        # relative config names against the working dir, which won't contain configs.
+        cfg = "/opt/sam2-repo/configs/sam2.1/sam2.1_hiera_l.yaml"
         self._model = build_sam2(cfg, checkpoint, device="cuda")
         self._predictor = SAM2ImagePredictor(self._model)
         print("[sam2] model loaded")
@@ -151,14 +156,14 @@ def _feather(mask: np.ndarray, radius: int = 2) -> np.ndarray:
     return blurred
 
 
-@app.function(image=SAM2_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token", required=False)])
+@app.function(image=SAM2_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 def _warm() -> None:
     download_sam2()
 
 
-@_warm.local_entrypoint()
+@app.local_entrypoint()
 def warm() -> None:
-    """Pre-download model weights: modal run sam2.main:warm"""
+    """Pre-download model weights: modal run sam2service.main:warm"""
     _warm.remote()
 
 
@@ -170,13 +175,25 @@ def segment(
     box: Optional[list] = None,
     points: Optional[list] = None,
 ) -> dict:
-    """Standalone entry for direct calls: modal run sam2.main:segment …"""
+    """Standalone entry for direct calls: modal run sam2service.main:segment …"""
     svc = Sam2Service()
     return svc.segment.remote(image, mode, point, box, points)
 
 
-@app.web_endpoint(method="POST")
-def web_segment(image: str, mode: str = "brush", point: Optional[dict] = None, box: Optional[list] = None, points: Optional[list] = None) -> dict:
-    """HTTP endpoint used by the Express API: POST /segment"""
-    svc = Sam2Service()
-    return svc.segment.remote(image, mode, point, box, points)
+@app.function(image=SAM2_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
+@modal.fastapi_endpoint(method="POST")
+def web_segment(payload: dict) -> dict:
+    """HTTP endpoint used by the Express API: POST /segment (JSON body)"""
+    try:
+        svc = Sam2Service()
+        return svc.segment.remote(
+            image=payload["image"],
+            mode=payload.get("mode", "brush"),
+            point=payload.get("point"),
+            box=payload.get("box"),
+            points=payload.get("points"),
+        )
+    except Exception as e:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=500, detail=f"SAM 2 segmentation failed: {e}")

@@ -5,8 +5,8 @@ import {
   Eraser,
   Hand,
   ImagePlus,
+  Lasso,
   LogOut,
-  MagicWand,
   Redo2,
   Scan,
   Sparkles,
@@ -31,7 +31,7 @@ const TOOLS: { id: SelectionTool; icon: typeof Scan; label: string }[] = [
   { id: 'brush', icon: Wand2, label: 'Brush' },
   { id: 'rect', icon: Square, label: 'Rectangle' },
   { id: 'ellipse', icon: Scan, label: 'Ellipse' },
-  { id: 'lasso', icon: MagicWand, label: 'Lasso' },
+  { id: 'lasso', icon: Lasso, label: 'Lasso' },
   { id: 'magic', icon: Sparkles, label: 'Magic select' },
   { id: 'pan', icon: Hand, label: 'Pan' },
 ];

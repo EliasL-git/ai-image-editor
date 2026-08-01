@@ -29,8 +29,15 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
   }
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Modal request failed (${res.status}): ${text.slice(0, 300)}`);
+    let message = `Modal request failed (${res.status})`;
+    try {
+      const parsed = (await res.json()) as { detail?: string; error?: string };
+      if (parsed?.detail) message = parsed.detail;
+      else if (parsed?.error) message = parsed.error;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(message);
   }
   return (await res.json()) as T;
 }
@@ -86,14 +93,46 @@ async function fallbackEdit(input: EditJobInput & { imageUrl: string }): Promise
   return { imageUrl, width: 1024, height: 1024, latencyMs: 80 };
 }
 
+/** Read a stored asset as a base64 data URL so Modal can fetch it remotely. */
+async function assetToDataUrl(urlOrId: string): Promise<string> {
+  // Already a data URL or a fully qualified http(s) URL — pass through.
+  if (urlOrId.startsWith('data:') || /^https?:\/\//.test(urlOrId)) return urlOrId;
+  const local = readFileByUrl(urlOrId);
+  if (local) {
+    const mime = urlOrId.endsWith('.webp') ? 'image/webp' : urlOrId.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    return `data:${mime};base64,${local.toString('base64')}`;
+  }
+  return urlOrId;
+}
+
+/** Resolve an upload id (or stored-asset URL) to its data URL (Modal containers can't reach localhost). */
+async function uploadIdToDataUrl(imageId: string): Promise<string> {
+  if (imageId.startsWith('data:') || /^https?:\/\//.test(imageId)) return imageId;
+  // Already a stored-asset URL like /uploads/<id>.png (edit flow passes sourceUrl).
+  const direct = readFileByUrl(imageId);
+  if (direct) {
+    const mime = imageId.endsWith('.webp') ? 'image/webp' : imageId.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    return `data:${mime};base64,${direct.toString('base64')}`;
+  }
+  for (const ext of ['jpg', 'png', 'webp']) {
+    const local = readFileByUrl(`/uploads/${imageId}.${ext}`);
+    if (local) {
+      const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+      return `data:${mime};base64,${local.toString('base64')}`;
+    }
+  }
+  throw new Error(`Upload not found: ${imageId}`);
+}
+
 export async function requestSegment(input: SegmentJobInput): Promise<SegmentResponse> {
   if (isLocalFallback() || !config.modalSamUrl) {
     const mask = await fallbackMask(input);
     return { ...mask, latencyMs: 120 };
   }
+  const image = await uploadIdToDataUrl(input.imageId);
   const res = await postJson<SegmentResponse>(
-    `${config.modalSamUrl.replace(/\/$/, '')}/segment`,
-    { ...input },
+    config.modalSamUrl.replace(/\/$/, ''),
+    { image, mode: input.mode, point: input.point, box: input.box, points: input.points },
     config.modalTokenId,
     config.modalTokenSecret,
   );
@@ -104,12 +143,14 @@ export async function requestEdit(input: EditJobInput & { imageUrl: string }): P
   if (isLocalFallback() || !config.modalFluxUrl) {
     return fallbackEdit(input);
   }
+  const image = await uploadIdToDataUrl(input.imageUrl);
+  const mask = await assetToDataUrl(input.mask);
   const res = await postJson<EditResponse>(
-    `${config.modalFluxUrl.replace(/\/$/, '')}/edit`,
+    config.modalFluxUrl.replace(/\/$/, ''),
     {
-      imageUrl: input.imageUrl,
+      image,
       prompt: input.prompt,
-      mask: input.mask,
+      mask,
       strength: input.strength ?? 0.85,
       seed: input.seed,
     },

@@ -54,7 +54,7 @@ packages/
   canvas/     Fabric.js helpers: mask overlay layers, preview compositing
   ui/         Small shared React UI components
 services/
-  modal/      Python Modal services (sam2/, flux/) + shared helpers
+  modal/      Python Modal services (sam2service/, flux/) + shared helpers
 storage/      (runtime, git-ignored) uploads/, history/, projects/
 render.yaml   Render blueprint
 ```

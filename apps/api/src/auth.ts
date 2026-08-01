@@ -28,16 +28,16 @@ export function verifyToken(token: string): AuthUser | null {
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith(TOKEN_PREFIX)) {
-    res.status(401).json({ error: 'Missing or invalid authorization header' });
-    return;
+  if (header && header.startsWith(TOKEN_PREFIX)) {
+    const user = verifyToken(header.slice(TOKEN_PREFIX.length));
+    if (user) {
+      res.locals.user = user;
+      next();
+      return;
+    }
   }
-  const user = verifyToken(header.slice(TOKEN_PREFIX.length));
-  if (!user) {
-    res.status(401).json({ error: 'Invalid or expired token' });
-    return;
-  }
-  res.locals.user = user;
+  // Auth is currently disabled: every request acts as a single shared local user.
+  res.locals.user = { id: 'local-user', email: 'local@local', name: 'Local' };
   next();
 }
 

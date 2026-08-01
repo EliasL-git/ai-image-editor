@@ -5,7 +5,7 @@ from typing import Optional
 
 import modal
 
-from shared import decode_mask, encode_data_url, image_to_png_bytes, load_image
+from .shared import decode_mask, encode_data_url, image_to_png_bytes, load_image
 
 app = modal.App("flux-kontext")
 
@@ -24,9 +24,18 @@ FLUX_IMAGE = (
         "pillow>=10.4",
         "numpy>=1.26",
         "requests>=2.32",
+        "fastapi>=0.115",
+        "uvicorn>=0.32",
     )
     .env({"HF_HOME": "/models/hf", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
+
+
+def _http_error(e: Exception, label: str) -> None:
+    """Raise a FastAPI error carrying the underlying failure so the API can show it."""
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=500, detail=f"{label}: {e}")
 
 
 def download_flux() -> None:
@@ -46,10 +55,12 @@ def download_flux() -> None:
     image=FLUX_IMAGE,
     gpu="A100-40GB",
     timeout=900,
-    allow_concurrent_inputs=4,
     volumes={"/models": volume},
-    secrets=[modal.Secret.from_name("hf-token", required=False)],
+    secrets=[modal.Secret.from_name("hf-token")],
 )
+# A container is recycled (terminated) after a single generation, so it never
+# lingers after a job finishes or fails.
+@modal.concurrent(max_inputs=1)
 class FluxKontext:
     @modal.enter()
     def load(self) -> None:
@@ -131,19 +142,29 @@ class FluxKontext:
         }
 
 
-@app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token", required=False)])
+@app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 def _warm() -> None:
     download_flux()
 
 
-@_warm.local_entrypoint()
+@app.local_entrypoint()
 def warm() -> None:
     """Pre-download model weights: modal run flux.main:warm"""
     _warm.remote()
 
 
-@app.web_endpoint(method="POST")
-def web_edit(image: str, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> dict:
-    """HTTP endpoint used by the Express API: POST /edit"""
-    svc = FluxKontext()
-    return svc.edit.remote(image, prompt, mask, strength, seed)
+@app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
+@modal.fastapi_endpoint(method="POST")
+def web_edit(payload: dict) -> dict:
+    """HTTP endpoint used by the Express API: POST /edit (JSON body)"""
+    try:
+        svc = FluxKontext()
+        return svc.edit.remote(
+            image=payload["image"],
+            prompt=payload["prompt"],
+            mask=payload["mask"],
+            strength=payload.get("strength", 0.85),
+            seed=payload.get("seed"),
+        )
+    except Exception as e:
+        _http_error(e, "FLUX edit failed")

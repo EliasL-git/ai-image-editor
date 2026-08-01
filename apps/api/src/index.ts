@@ -21,7 +21,7 @@ import {
 } from './store.js';
 import { upload, saveUpload, saveMask, saveResult, saveExport, readFileByUrl } from './uploads.js';
 import { requestSegment, requestEdit } from './modal.js';
-import { isLocalFallback } from './config.js';
+import { isLocalFallback, publicUrl } from './config.js';
 import type { User } from '@aie/types';
 
 const app = express();

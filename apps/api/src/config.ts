@@ -1,8 +1,12 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// dotenv's default cwd is the package dir (apps/api), but the canonical config
+// lives at the repo root (.env.example -> .env). No-op if it doesn't exist.
+dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
 
 function int(value: string | undefined, fallback: number): number {
   const n = Number.parseInt(value ?? '', 10);

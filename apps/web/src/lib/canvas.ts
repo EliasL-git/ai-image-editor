@@ -1,4 +1,4 @@
-import { fabric } from 'fabric';
+import * as fabric from 'fabric';
 import { DRAWING_COLOR, MASK_OVERLAY_COLOR, MAX_ZOOM, MIN_ZOOM } from '@aie/shared';
 import type { Point, SelectionTool } from '@aie/types';
 import { boxFromPoints, type StrokeHint } from '@aie/canvas';
@@ -339,7 +339,7 @@ export class EditorCanvas {
       this.drawLayer = new fabric.Group([], { selectable: false, evented: false });
       this.canvas.add(this.drawLayer);
     }
-    this.drawLayer.addWithUpdate(obj);
+    this.drawLayer.add(obj);
   }
 
   private toImagePoint(e: MouseEvent | WheelEvent): Point {

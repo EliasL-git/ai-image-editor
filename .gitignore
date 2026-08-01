@@ -10,3 +10,5 @@ data/
 coverage/
 .vite/
 *.tsbuildinfo
+__pycache__/
+*.pyc
