@@ -41,12 +41,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   next();
 }
 
-export function currentUser(req: Request): AuthUser {
-  return resLocalsUser(req) as AuthUser;
-}
-
-function resLocalsUser(req: Request): AuthUser | undefined {
-  // express 4 stores locals on res; this helper keeps call sites clean
-  const res = (req as unknown as { res?: Response }).res;
-  return res?.locals?.user as AuthUser | undefined;
+/** Read the authenticated user previously set by requireAuth. */
+export function userOf(res: Response): AuthUser {
+  return res.locals.user as AuthUser;
 }
