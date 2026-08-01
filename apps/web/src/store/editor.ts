@@ -9,27 +9,22 @@ export type JobState =
   | { kind: 'error'; message: string };
 
 export interface EditorState {
-  // canvas image
   imageUrl: string | null;
   imageId: string | null;
   imageWidth: number;
   imageHeight: number;
   imageName: string;
 
-  // selection
   tool: SelectionTool;
   hint: StrokeHint | null;
   maskUrl: string | null;
-  maskDataUrl: string | null; // rasterized local preview
+  maskDataUrl: string | null;
 
-  // prompt / edit
   prompt: string;
   strength: number;
 
-  // job
   job: JobState;
 
-  // history (client-side undo stack within the session)
   undoStack: string[];
   redoStack: string[];
 
@@ -97,7 +92,11 @@ export const useEditor = create<EditorState>((set, get) => ({
     const s = get();
     if (s.undoStack.length === 0) return null;
     const prev = s.undoStack[s.undoStack.length - 1];
-    set({ undoStack: s.undoStack.slice(0, -1), redoStack: [...s.redoStack, s.imageUrl ?? ''].filter(Boolean) });
+    set({
+      undoStack: s.undoStack.slice(0, -1),
+      redoStack: [...s.redoStack, s.imageUrl ?? ''].filter(Boolean),
+      imageUrl: prev,
+    });
     return prev;
   },
 
@@ -105,7 +104,11 @@ export const useEditor = create<EditorState>((set, get) => ({
     const s = get();
     if (s.redoStack.length === 0) return null;
     const next = s.redoStack[s.redoStack.length - 1];
-    set({ redoStack: s.redoStack.slice(0, -1), undoStack: [...s.undoStack, s.imageUrl ?? ''].filter(Boolean) });
+    set({
+      redoStack: s.redoStack.slice(0, -1),
+      undoStack: [...s.undoStack, s.imageUrl ?? ''].filter(Boolean),
+      imageUrl: next,
+    });
     return next;
   },
 
