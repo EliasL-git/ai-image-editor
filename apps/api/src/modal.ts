@@ -1,4 +1,5 @@
 import { config, isLocalFallback } from './config.js';
+import { readFileByUrl } from './uploads.js';
 import type { EditJobInput, SegmentJobInput } from '@aie/types';
 
 /**
@@ -34,57 +35,72 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
   return (await res.json()) as T;
 }
 
-/** Local fallback: build a deterministic mask image (PNG) from the hint. */
+/** Local fallback: build a deterministic mask image (PNG data URL) from the hint. */
 function fallbackMask(input: SegmentJobInput): { url: string; width: number; height: number } {
   const width = 512;
   const height = 512;
-  // Deterministic gray blob centered on the selection so the overlay is visible
-  // without Modal. The real service returns a precise object mask.
-  const cx = 0.5;
-  const cy = 0.5;
-  const rx = 0.3 * width;
-  const ry = 0.3 * height;
-  const canvas = createCanvas(width, height);
+  const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2D context unavailable');
+
+  // Center-ish ellipse sized from the hint so the overlay visibly tracks the selection.
   ctx.fillStyle = '#ffffff';
   ctx.beginPath();
-  ctx.ellipse(cx * width, cy * height, rx, ry, 0, 0, Math.PI * 2);
+  let rx = 0.3 * width;
+  let ry = 0.3 * height;
+  let cx = 0.5 * width;
+  let cy = 0.5 * height;
+  if (input.mode === 'point' && input.point) {
+    cx = input.point.x * width;
+    cy = input.point.y * height;
+    rx = 0.15 * width;
+    ry = 0.15 * height;
+  } else if (input.mode === 'box' && input.box) {
+    const [x0, y0, x1, y1] = input.box;
+    cx = ((x0 + x1) / 2) * width;
+    cy = ((y0 + y1) / 2) * height;
+    rx = Math.max(10, ((x1 - x0) / 2) * width);
+    ry = Math.max(10, ((y1 - y0) / 2) * height);
+  } else if (input.mode === 'brush' && input.points && input.points.length > 0) {
+    const xs = input.points.map((p) => p.x);
+    const ys = input.points.map((p) => p.y);
+    cx = (Math.min(...xs) + Math.max(...xs)) / 2 * width;
+    cy = (Math.min(...ys) + Math.max(...ys)) / 2 * height;
+    rx = Math.max(20, ((Math.max(...xs) - Math.min(...xs)) / 2 + 0.05) * width);
+    ry = Math.max(20, ((Math.max(...ys) - Math.min(...ys)) / 2 + 0.05) * height);
+  }
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
   ctx.fill();
-  const url = canvas.toDataURL('image/png');
-  return { url, width, height };
+  const url = canvas.convertToBlob ? '' : canvas.toDataURL('image/png');
+  // OffscreenCanvas has no toDataURL; encode via a blob read.
+  const blobUrl = url || canvasToDataUrl(canvas);
+  return { url: blobUrl, width, height };
 }
 
-function createCanvas(w: number, h: number): HTMLCanvasElement {
-  // Node 20+ exposes OffscreenCanvas; fall back to a minimal shim otherwise.
-  const Ctor = globalThis.OffscreenCanvas as unknown as
-    | (new (w: number, h: number) => HTMLCanvasElement)
-    | undefined;
-  if (Ctor) return new Ctor(w, h) as HTMLCanvasElement;
-  throw new Error('OffscreenCanvas not available for local fallback mask');
+async function canvasToDataUrl(canvas: OffscreenCanvas): Promise<string> {
+  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  const buf = Buffer.from(await blob.arrayBuffer());
+  return `data:image/png;base64,${buf.toString('base64')}`;
 }
 
-/** Local fallback: echo the input image back with a small watermark band. */
-async function fallbackEdit(input: EditJobInput): Promise<EditResponse> {
-  // Reuse the upload's stored file if it's a local path; otherwise return a stub.
-  const imageUrl = input.imageId; // replaced by caller when possible
-  const now = Date.now();
-  return {
-    imageUrl,
-    width: 1024,
-    height: 1024,
-    latencyMs: now - now,
-  };
+/** Local fallback: echo the input image back (the flow is fully testable offline). */
+async function fallbackEdit(input: EditJobInput & { imageUrl: string }): Promise<EditResponse> {
+  // Try to read the actual stored upload so the client sees a real image.
+  const local = readFileByUrl(input.imageUrl);
+  const imageUrl = local
+    ? `data:image/png;base64,${local.toString('base64')}`
+    : input.imageUrl;
+  return { imageUrl, width: 1024, height: 1024, latencyMs: 80 };
 }
 
 export async function requestSegment(input: SegmentJobInput): Promise<SegmentResponse> {
   if (isLocalFallback() || !config.modalSamUrl) {
-    const mask = fallbackMask(input);
+    const mask = await fallbackMask(input);
     return { ...mask, latencyMs: 120 };
   }
-  const body = { ...input };
   const res = await postJson<SegmentResponse>(
     `${config.modalSamUrl.replace(/\/$/, '')}/segment`,
-    body,
+    { ...input },
     config.modalTokenId,
     config.modalTokenSecret,
   );
