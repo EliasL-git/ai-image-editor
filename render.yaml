@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: ai-image-editor-web
+    runtime: node
+    repo: https://github.com/EliasL-git/ai-image-editor
+    plan: starter
+    rootDir: .
+    buildCommand: npm ci && npm run build:web
+    startCommand: npm run start:web
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.0
+      - key: VITE_API_URL
+        sync: false
+      - key: API_URL
+        sync: false
+
+  - type: web
+    name: ai-image-editor-api
+    runtime: node
+    repo: https://github.com/EliasL-git/ai-image-editor
+    plan: starter
+    rootDir: .
+    buildCommand: npm ci && npm run build:api
+    startCommand: npm run start:api
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.0
+      - key: PORT
+        value: 8080
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /var/data
+      - key: MODAL_SAM_URL
+        sync: false
+      - key: MODAL_FLUX_URL
+        sync: false
+      - key: MODAL_TOKEN_ID
+        sync: false
+      - key: MODAL_TOKEN_SECRET
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: 15
+      - key: CORS_ORIGIN
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
+      - key: API_INTERNAL_URL
+        sync: false
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 10
