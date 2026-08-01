@@ -28,12 +28,14 @@ export class EditorCanvas {
   private overlay: fabric.Image | null = null;
   private drawLayer: fabric.Group | null = null;
   private drawing = false;
+  private currentTool: SelectionTool = 'brush';
   private currentPath: fabric.Path | null = null;
   private currentRect: fabric.Rect | null = null;
   private currentEllipse: fabric.Ellipse | null = null;
   private currentPolyline: fabric.Polyline | null = null;
   private strokePoints: Point[] = [];
   private startPoint: Point | null = null;
+  private lastPan: Point | null = null;
   private cb: CanvasCallbacks;
   private disposed = false;
 
@@ -95,13 +97,11 @@ export class EditorCanvas {
       selectable: false,
       evented: false,
       opacity: 0.45,
-      // colorize: tint non-white to cyan via multiply on a bright overlay
       filters: [new fabric.filters.BlendColor({ color: '#22d3ee', mode: 'tint' })],
     });
     img.applyFilters();
     this.canvas.add(img);
     img.sendToBack();
-    // place above image but below strokes
     this.overlay.moveTo(1);
     this.render();
   }
@@ -115,6 +115,7 @@ export class EditorCanvas {
   }
 
   setTool(tool: SelectionTool): void {
+    this.currentTool = tool;
     this.canvas.selection = false;
     this.canvas.defaultCursor = tool === 'pan' ? 'grab' : 'crosshair';
     this.canvas.hoverCursor = this.canvas.defaultCursor;
@@ -150,7 +151,6 @@ export class EditorCanvas {
     return this.canvas.toDataURL({ format, quality, multiplier: 1 });
   }
 
-  /** Composite the current view (image + result) into a data URL. */
   exportDataUrl(): string {
     return this.canvas.toDataURL({ format: 'png', multiplier: 1 });
   }
@@ -179,7 +179,7 @@ export class EditorCanvas {
       this.startPoint = p;
       this.strokePoints = [p];
       const tool = this.currentTool;
-      if (tool === 'brush') {
+      if (tool === 'brush' || tool === 'magic') {
         this.drawing = true;
         this.currentPath = new fabric.Path(`M ${p.x} ${p.y}`, {
           stroke: DRAWING_COLOR,
@@ -308,10 +308,6 @@ export class EditorCanvas {
       opt.e.stopPropagation();
     });
   }
-
-  private currentTool: SelectionTool = 'brush';
-
-  private lastPan: Point | null = null;
 
   private emitHint(tool: SelectionTool): void {
     const points = this.strokePoints;
