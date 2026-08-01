@@ -36,14 +36,13 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
 }
 
 /** Local fallback: build a deterministic mask image (PNG data URL) from the hint. */
-function fallbackMask(input: SegmentJobInput): { url: string; width: number; height: number } {
+async function fallbackMask(input: SegmentJobInput): Promise<{ url: string; width: number; height: number }> {
   const width = 512;
   const height = 512;
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2D context unavailable');
 
-  // Center-ish ellipse sized from the hint so the overlay visibly tracks the selection.
   ctx.fillStyle = '#ffffff';
   ctx.beginPath();
   let rx = 0.3 * width;
@@ -64,28 +63,22 @@ function fallbackMask(input: SegmentJobInput): { url: string; width: number; hei
   } else if (input.mode === 'brush' && input.points && input.points.length > 0) {
     const xs = input.points.map((p) => p.x);
     const ys = input.points.map((p) => p.y);
-    cx = (Math.min(...xs) + Math.max(...xs)) / 2 * width;
-    cy = (Math.min(...ys) + Math.max(...ys)) / 2 * height;
+    cx = ((Math.min(...xs) + Math.max(...xs)) / 2) * width;
+    cy = ((Math.min(...ys) + Math.max(...ys)) / 2) * height;
     rx = Math.max(20, ((Math.max(...xs) - Math.min(...xs)) / 2 + 0.05) * width);
     ry = Math.max(20, ((Math.max(...ys) - Math.min(...ys)) / 2 + 0.05) * height);
   }
   ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
   ctx.fill();
-  const url = canvas.convertToBlob ? '' : canvas.toDataURL('image/png');
-  // OffscreenCanvas has no toDataURL; encode via a blob read.
-  const blobUrl = url || canvasToDataUrl(canvas);
-  return { url: blobUrl, width, height };
-}
 
-async function canvasToDataUrl(canvas: OffscreenCanvas): Promise<string> {
   const blob = await canvas.convertToBlob({ type: 'image/png' });
   const buf = Buffer.from(await blob.arrayBuffer());
-  return `data:image/png;base64,${buf.toString('base64')}`;
+  const url = `data:image/png;base64,${buf.toString('base64')}`;
+  return { url, width, height };
 }
 
 /** Local fallback: echo the input image back (the flow is fully testable offline). */
 async function fallbackEdit(input: EditJobInput & { imageUrl: string }): Promise<EditResponse> {
-  // Try to read the actual stored upload so the client sees a real image.
   const local = readFileByUrl(input.imageUrl);
   const imageUrl = local
     ? `data:image/png;base64,${local.toString('base64')}`
