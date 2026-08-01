@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
+import multer from 'multer';
 import { nanoid } from 'nanoid';
 import { dirs } from './store.js';
 import { config, publicUrl } from './config.js';
@@ -111,8 +112,6 @@ export function readFileByUrl(relativeUrl: string): Buffer | null {
 }
 
 // Multer memory storage with a size guard
-import multer from 'multer';
-
 export const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: config.maxUploadBytes, files: 1 },
