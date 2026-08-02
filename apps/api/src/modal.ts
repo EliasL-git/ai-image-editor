@@ -25,19 +25,21 @@ export interface EditResponse {
 /** Text-to-image response shape (same as edit). */
 export type GenerateResponse = EditResponse;
 
-/** One event from the FLUX streaming endpoints (SSE `data:` frames). */
+/** One progress frame for a FLUX job, read back from the Modal progress store. */
 export interface FluxStreamEvent {
   type: 'progress' | 'result' | 'error';
   progress?: number;
   stage?: string;
-  step?: number;
-  total?: number;
   preview?: string;
   imageUrl?: string;
   width?: number;
   height?: number;
   latencyMs?: number;
   message?: string;
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSecret?: string): Promise<T> {
@@ -63,76 +65,6 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
   const data = (await res.json()) as T;
   console.log(`[modal] POST ${url} → ${res.status} (${elapsed}ms) OK`);
   return data;
-}
-
-/**
- * POST to a Modal streaming (SSE) endpoint and dispatch each `data:` frame to
- * `onEvent`. If the endpoint responds with plain JSON (local fallback / old
- * deploy), the whole body is dispatched as a single event. Events are awaited
- * so handlers can do async work (saving previews) without racing.
- */
-async function streamSse(
-  url: string,
-  body: unknown,
-  onEvent: (ev: FluxStreamEvent) => void | Promise<void>,
-  tokenId?: string,
-  tokenSecret?: string,
-): Promise<void> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (tokenId && tokenSecret) {
-    headers.authorization = `Basic ${Buffer.from(`${tokenId}:${tokenSecret}`).toString('base64')}`;
-  }
-  const started = Date.now();
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  if (!res.ok) {
-    let message = `Modal request failed (${res.status})`;
-    try {
-      const parsed = (await res.json()) as { detail?: string; error?: string };
-      if (parsed?.detail) message = parsed.detail;
-      else if (parsed?.error) message = parsed.error;
-    } catch {
-      /* keep default */
-    }
-    console.log(`[modal] POST ${url} → ${res.status} (${Date.now() - started}ms): ${message}`);
-    throw new Error(message);
-  }
-  const contentType = res.headers.get('content-type') ?? '';
-  console.log(`[modal] POST ${url} → ${res.status} stream (${contentType})`);
-
-  if (!contentType.includes('text/event-stream')) {
-    // Non-streaming response: single JSON object (fallback / legacy deploy).
-    const data = (await res.json()) as FluxStreamEvent;
-    await onEvent(data);
-    return;
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    await onEvent({ type: 'error', message: 'Modal stream body unavailable' });
-    return;
-  }
-  const decoder = new TextDecoder();
-  let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let idx: number;
-    while ((idx = buffer.indexOf('\n\n')) >= 0) {
-      const chunk = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-      for (const line of chunk.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        try {
-          await onEvent(JSON.parse(payload) as FluxStreamEvent);
-        } catch {
-          /* skip malformed frame */
-        }
-      }
-    }
-  }
 }
 
 /** Local fallback: build a deterministic mask image (PNG data URL) from the hint. */
@@ -242,46 +174,55 @@ export async function requestSegment(input: SegmentJobInput): Promise<SegmentRes
   return res;
 }
 
-export async function requestEditStream(
-  input: EditJobInput & { imageUrl: string },
-  onEvent: (ev: FluxStreamEvent) => void | Promise<void>,
-): Promise<void> {
-  if (isLocalFallback() || !config.modalFluxUrl) {
-    const r = await fallbackEdit(input);
-    await onEvent({ type: 'result', ...r });
-    return;
-  }
+/** Kick off a FLUX Kontext edit (async spawn); progress is polled via fetchFluxStatus. */
+export async function startFluxEdit(input: EditJobInput & { imageUrl: string } & { jobId: string }): Promise<void> {
+  if (isLocalFallback() || !config.modalFluxUrl) return;
   const image = await uploadIdToDataUrl(input.imageUrl);
   const mask = await assetToDataUrl(input.mask);
-  await streamSse(
+  await postJson(
     config.modalFluxUrl.replace(/\/$/, ''),
-    {
-      image,
-      prompt: input.prompt,
-      mask,
-      strength: input.strength ?? 0.85,
-      seed: input.seed,
-    },
-    onEvent,
+    { jobId: input.jobId, image, prompt: input.prompt, mask, strength: input.strength ?? 0.85, seed: input.seed },
     config.modalTokenId,
     config.modalTokenSecret,
   );
 }
 
-export async function requestGenerateStream(
-  input: { prompt: string; seed?: number },
-  onEvent: (ev: FluxStreamEvent) => void | Promise<void>,
-): Promise<void> {
-  if (isLocalFallback() || !config.modalGenerateUrl) {
-    const r = fallbackGenerate(input.prompt);
-    await onEvent({ type: 'result', ...r });
-    return;
-  }
-  await streamSse(
+/** Kick off a FLUX.1-dev text-to-image generation (async spawn). */
+export async function startFluxGenerate(input: { jobId: string; prompt: string; seed?: number }): Promise<void> {
+  if (isLocalFallback() || !config.modalGenerateUrl) return;
+  await postJson(
     config.modalGenerateUrl.replace(/\/$/, ''),
-    { prompt: input.prompt, seed: input.seed },
-    onEvent,
+    { jobId: input.jobId, prompt: input.prompt, seed: input.seed },
     config.modalTokenId,
     config.modalTokenSecret,
   );
+}
+
+/** Read the current progress frame for a job from Modal (null while it warms up). */
+export async function fetchFluxStatus(jobId: string): Promise<FluxStreamEvent | null> {
+  if (isLocalFallback() || !config.modalStatusUrl) return null;
+  return postJson<FluxStreamEvent | null>(
+    config.modalStatusUrl.replace(/\/$/, ''),
+    { jobId },
+    config.modalTokenId,
+    config.modalTokenSecret,
+  );
+}
+
+/** Drop a job's progress frame once the API is done with it. */
+export async function clearFluxStatus(jobId: string): Promise<void> {
+  if (isLocalFallback() || !config.modalClearUrl) return;
+  await postJson(config.modalClearUrl.replace(/\/$/, ''), { jobId }, config.modalTokenId, config.modalTokenSecret).catch(() => {
+    /* best-effort cleanup */
+  });
+}
+
+/** Local fallback result for the edit flow (offline testing). */
+export async function localFallbackEdit(input: EditJobInput & { imageUrl: string }): Promise<EditResponse> {
+  return fallbackEdit(input);
+}
+
+/** Local fallback result for the generate flow (offline testing). */
+export function localFallbackGenerate(prompt: string): GenerateResponse {
+  return fallbackGenerate(prompt);
 }

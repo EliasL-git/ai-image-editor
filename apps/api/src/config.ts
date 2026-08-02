@@ -33,6 +33,13 @@ export const config = {
   modalGenerateUrl:
     process.env.MODAL_GENERATE_URL ??
     (process.env.MODAL_FLUX_URL ? process.env.MODAL_FLUX_URL.replace(/web-edit/, 'web-generate') : ''),
+  // Job progress endpoints (shared by edit + generate); derived from generate URL.
+  modalStatusUrl:
+    process.env.MODAL_STATUS_URL ??
+    (process.env.MODAL_GENERATE_URL ? process.env.MODAL_GENERATE_URL.replace(/web-generate/, 'web-status') : ''),
+  modalClearUrl:
+    process.env.MODAL_CLEAR_URL ??
+    (process.env.MODAL_GENERATE_URL ? process.env.MODAL_GENERATE_URL.replace(/web-generate/, 'web-clear') : ''),
   modalTokenId: process.env.MODAL_TOKEN_ID ?? '',
   modalTokenSecret: process.env.MODAL_TOKEN_SECRET ?? '',
 

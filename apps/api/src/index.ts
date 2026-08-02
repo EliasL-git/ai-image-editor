@@ -20,7 +20,7 @@ import {
   type StoredUser,
 } from './store.js';
 import { upload, saveUpload, saveMask, saveResult, saveExport, savePreview, readFileByUrl } from './uploads.js';
-import { requestSegment, requestEditStream, requestGenerateStream } from './modal.js';
+import { requestSegment, startFluxEdit, startFluxGenerate, fetchFluxStatus, clearFluxStatus, localFallbackEdit, localFallbackGenerate, sleep, type FluxStreamEvent } from './modal.js';
 import { isLocalFallback, publicUrl } from './config.js';
 import type { User } from '@aie/types';
 
@@ -128,6 +128,46 @@ app.post('/upload', requireAuth, upload.single('file'), async (req: Request, res
 // ---------------------------------------------------------------------------
 // Jobs: segment (SAM 2) and edit (FLUX Kontext)
 // ---------------------------------------------------------------------------
+
+/**
+ * Poll the Modal progress store until a result/error frame arrives (or we time
+ * out). Progress frames update the job live; the onResult callback persists the
+ * final image.
+ */
+async function pollFluxJob(
+  jobId: string,
+  kind: 'edit' | 'generate',
+  onResult: (ev: FluxStreamEvent) => Promise<void>,
+): Promise<void> {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const ev = await fetchFluxStatus(jobId);
+    if (ev) {
+      if (ev.type === 'progress') {
+        let previewUrl: string | undefined;
+        if (ev.preview) previewUrl = await savePreview(jobId, ev.preview);
+        updateJob(jobId, {
+          progress: ev.progress ?? 35,
+          stage: ev.stage
+            ? `${kind === 'edit' ? 'Editing image…' : 'Generating image…'} ${ev.stage}`
+            : kind === 'edit'
+              ? 'Editing image…'
+              : 'Generating image…',
+          ...(previewUrl ? { previewUrl } : {}),
+        });
+        log('job', `[${jobId}] ${kind} ${ev.stage ?? ''} (${ev.progress ?? ''}%)`);
+      } else if (ev.type === 'error') {
+        throw new Error(ev.message ?? `FLUX ${kind} failed`);
+      } else if (ev.type === 'result' && ev.imageUrl) {
+        await onResult(ev);
+        return;
+      }
+    }
+    await sleep(1500);
+  }
+  throw new Error('Timed out waiting for Modal to finish (cold start too slow)');
+}
+
 app.post('/segment', requireAuth, async (req: Request, res: Response) => {
   const user = userOf(res);
   const { imageId, mode, point, box, points } = req.body ?? {};
@@ -194,35 +234,35 @@ app.post('/edit', requireAuth, async (req: Request, res: Response) => {
   void (async () => {
     const started = Date.now();
     try {
+      if (isLocalFallback() || !config.modalFluxUrl) {
+        updateJob(job.id, { status: 'running', progress: 40, stage: 'Editing image…' });
+        const sourceUrl = await resolveSourceUrl(imageId);
+        const r = await localFallbackEdit({ imageId, prompt, mask, strength, seed, imageUrl: sourceUrl });
+        updateJob(job.id, { stage: 'Finalizing…' });
+        completeJob(job.id, { imageUrl: r.imageUrl, width: r.width, height: r.height, latencyMs: r.latencyMs });
+        log('job', `[${job.id}] edit done (local fallback)`);
+        return;
+      }
       updateJob(job.id, { status: 'running', progress: 10, stage: 'Waiting for Modal to power on…' });
       const sourceUrl = await resolveSourceUrl(imageId);
       log('job', `[${job.id}] edit running → FLUX Kontext (source=${sourceUrl})`);
-      await requestEditStream({ imageId, prompt, mask, strength, seed, imageUrl: sourceUrl }, async (ev) => {
-        if (ev.type === 'progress') {
-          let previewUrl: string | undefined;
-          if (ev.preview) previewUrl = await savePreview(job.id, ev.preview);
-          updateJob(job.id, {
-            progress: ev.progress ?? 35,
-            stage: ev.stage ? `Editing image… ${ev.stage}` : 'Editing image…',
-            ...(previewUrl ? { previewUrl } : {}),
-          });
-          log('job', `[${job.id}] edit ${ev.stage ?? ''} (${ev.progress ?? ''}%)`);
-        } else if (ev.type === 'error') {
-          throw new Error(ev.message ?? 'FLUX edit failed');
-        } else if (ev.type === 'result' && ev.imageUrl) {
-          let imageUrl = ev.imageUrl;
-          if (imageUrl.startsWith('data:')) {
-            const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
-            imageUrl = saved.url;
-          }
-          updateJob(job.id, { stage: 'Finalizing…' });
-          completeJob(job.id, { imageUrl, width: ev.width ?? 1024, height: ev.height ?? 1024, latencyMs: ev.latencyMs ?? 0 });
-          log('job', `[${job.id}] edit done in ${Date.now() - started}ms → ${imageUrl}`);
+      await startFluxEdit({ jobId: job.id, imageId, prompt, mask, strength, seed, imageUrl: sourceUrl });
+      await pollFluxJob(job.id, 'edit', async (ev) => {
+        if (!ev.imageUrl) return;
+        let imageUrl = ev.imageUrl;
+        if (imageUrl.startsWith('data:')) {
+          const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
+          imageUrl = saved.url;
         }
+        updateJob(job.id, { stage: 'Finalizing…' });
+        completeJob(job.id, { imageUrl, width: ev.width ?? 1024, height: ev.height ?? 1024, latencyMs: ev.latencyMs ?? 0 });
+        log('job', `[${job.id}] edit done in ${Date.now() - started}ms → ${imageUrl}`);
       });
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
       log('job', `[${job.id}] edit FAILED: ${(err as Error).message}`);
+    } finally {
+      await clearFluxStatus(job.id);
     }
   })();
 
@@ -249,34 +289,33 @@ app.post('/generate', requireAuth, async (req: Request, res: Response) => {
   void (async () => {
     const started = Date.now();
     try {
+      if (isLocalFallback() || !config.modalGenerateUrl) {
+        updateJob(job.id, { status: 'running', progress: 40, stage: 'Generating image…' });
+        const r = localFallbackGenerate(prompt);
+        updateJob(job.id, { stage: 'Finalizing…' });
+        completeJob(job.id, { imageUrl: r.imageUrl, width: r.width, height: r.height, latencyMs: r.latencyMs });
+        log('job', `[${job.id}] generate done (local fallback)`);
+        return;
+      }
       updateJob(job.id, { status: 'running', progress: 10, stage: 'Waiting for Modal to power on…' });
-      log('job', `[${job.id}] generate running → FLUX.1-dev (streaming)`);
-      await requestGenerateStream({ prompt, seed }, async (ev) => {
-        if (ev.type === 'progress') {
-          let previewUrl: string | undefined;
-          if (ev.preview) previewUrl = await savePreview(job.id, ev.preview);
-          updateJob(job.id, {
-            progress: ev.progress ?? 35,
-            stage: ev.stage ? `Generating image… ${ev.stage}` : 'Generating image…',
-            ...(previewUrl ? { previewUrl } : {}),
-          });
-          log('job', `[${job.id}] generate ${ev.stage ?? ''} (${ev.progress ?? ''}%)`);
-        } else if (ev.type === 'error') {
-          throw new Error(ev.message ?? 'FLUX generate failed');
-        } else if (ev.type === 'result' && ev.imageUrl) {
-          let imageUrl = ev.imageUrl;
-          if (imageUrl.startsWith('data:')) {
-            const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
-            imageUrl = saved.url;
-          }
-          updateJob(job.id, { stage: 'Finalizing…' });
-          completeJob(job.id, { imageUrl, width: ev.width ?? 1024, height: ev.height ?? 1024, latencyMs: ev.latencyMs ?? 0 });
-          log('job', `[${job.id}] generate done in ${Date.now() - started}ms → ${imageUrl}`);
+      log('job', `[${job.id}] generate running → FLUX.1-dev`);
+      await startFluxGenerate({ jobId: job.id, prompt, seed });
+      await pollFluxJob(job.id, 'generate', async (ev) => {
+        if (!ev.imageUrl) return;
+        let imageUrl = ev.imageUrl;
+        if (imageUrl.startsWith('data:')) {
+          const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
+          imageUrl = saved.url;
         }
+        updateJob(job.id, { stage: 'Finalizing…' });
+        completeJob(job.id, { imageUrl, width: ev.width ?? 1024, height: ev.height ?? 1024, latencyMs: ev.latencyMs ?? 0 });
+        log('job', `[${job.id}] generate done in ${Date.now() - started}ms → ${imageUrl}`);
       });
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
       log('job', `[${job.id}] generate FAILED: ${(err as Error).message}`);
+    } finally {
+      await clearFluxStatus(job.id);
     }
   })();
 

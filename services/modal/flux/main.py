@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import math
-import queue
-import threading
+import os
+import shutil
 import time
-from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,6 +21,11 @@ def log(msg: str) -> None:
 # Shared model volume (same one SAM uses) so weights are downloaded once.
 volume = modal.Volume.from_name("aie-models", create_if_missing=True)
 
+# Shared progress store: GPU containers write per-job progress here; the Express
+# API polls it via web_status. Xet is disabled because its lazy symlinks don't
+# survive a Modal volume commit.
+progress_store = modal.Dict.from_name("flux-progress", create_if_missing=True)
+
 FLUX_IMAGE = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -38,14 +41,12 @@ FLUX_IMAGE = (
         "fastapi>=0.115",
         "uvicorn>=0.32",
     )
-    .env({"HF_HOME": "/models/hf", "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({"HF_HOME": "/models/hf", "HF_HUB_DISABLE_XET": "1"})
 )
 
 
 def download_flux() -> None:
     """Ensure the FLUX Kontext Dev weights are cached on the volume."""
-    import os
-
     os.makedirs("/models/hf", exist_ok=True)
     from huggingface_hub import snapshot_download
 
@@ -56,15 +57,21 @@ def download_flux() -> None:
 
 
 def download_flux_dev() -> None:
-    """Ensure the FLUX.1-dev (text-to-image) weights are cached on the volume."""
-    import os
+    """Ensure the FLUX.1-dev (text-to-image) weights are cached on the volume.
 
+    We wipe any prior partial/broken download first (a previous Xet-backed
+    download left symlinks that don't survive a Modal volume commit).
+    """
     os.makedirs("/models/hf", exist_ok=True)
+    dest = "/models/hf/FLUX.1-dev"
+    if os.path.exists(dest):
+        log("clearing previous FLUX.1-dev download…")
+        shutil.rmtree(dest)
     from huggingface_hub import snapshot_download
 
     snapshot_download(
         "black-forest-labs/FLUX.1-dev",
-        local_dir="/models/hf/FLUX.1-dev",
+        local_dir=dest,
     )
 
 
@@ -81,52 +88,22 @@ def _decode_latents(pipe, latents, max_size: int = 288):
     return pil
 
 
-def _stream_run(total_steps: int, sample_every: int, run) -> Iterable[dict]:
-    """Run the pipe call in a background thread, streaming progress + final events.
-
-    Each yielded dict is one of:
-      {"type": "progress", "progress", "step", "total", "stage", "preview"}
-      {"type": "result", "imageUrl", "width", "height", "latencyMs"}
-      {"type": "error", "message"}
-    """
-    q: queue.Queue = queue.Queue()
-
-    def on_step(pipe, step_index, timestep, callback_kwargs):
-        if step_index % sample_every == 0:
-            try:
-                pil = _decode_latents(pipe, callback_kwargs["latents"])
-                png = image_to_png_bytes(pil)
-                progress = round(35 + 60 * ((step_index + 1) / total_steps))
-                q.put(
-                    {
-                        "type": "progress",
-                        "progress": progress,
-                        "step": step_index,
-                        "total": total_steps,
-                        "stage": f"step {step_index + 1}/{total_steps}",
-                        "preview": encode_data_url(png),
-                    }
-                )
-            except Exception as e:
-                log(f"preview decode failed: {e}")
-        return callback_kwargs
-
-    def worker():
+def _progress(pipe, job_id: str, step_index: int, total: int, sample_every: int, callback_kwargs: dict) -> dict:
+    """Store a progress frame for the job when the step should be sampled."""
+    if step_index % sample_every == 0:
         try:
-            result = run(on_step)
-            q.put({"type": "result", **result})
+            pil = _decode_latents(pipe, callback_kwargs["latents"])
+            png = image_to_png_bytes(pil)
+            progress = round(35 + 60 * ((step_index + 1) / total))
+            progress_store[job_id] = {
+                "type": "progress",
+                "progress": progress,
+                "stage": f"step {step_index + 1}/{total}",
+                "preview": encode_data_url(png),
+            }
         except Exception as e:
-            log(f"inference failed: {e}")
-            q.put({"type": "error", "message": f"{e}"})
-        finally:
-            q.put(None)
-
-    threading.Thread(target=worker, daemon=True).start()
-    while True:
-        item = q.get()
-        if item is None:
-            break
-        yield item
+            log(f"preview decode failed: {e}")
+    return callback_kwargs
 
 
 @app.cls(
@@ -180,44 +157,43 @@ class FluxKontext:
         log(f"model loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
-    def edit(self, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> Iterable[dict]:
+    def edit(self, job_id: str, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> dict:
         import numpy as np
         import torch
         from PIL import Image as PILImage
 
-        started = time.time()
+        try:
+            started = time.time()
+            src = load_image(image)
+            src_w, src_h = src.size
 
-        src = load_image(image)
-        src_w, src_h = src.size
+            # Standard FLUX edit sizing (divisible by 16)
+            w = max(256, min(1024, (src_w // 16) * 16))
+            h = max(256, min(1024, (src_h // 16) * 16))
 
-        # Standard FLUX edit sizing (divisible by 16)
-        w = max(256, min(1024, (src_w // 16) * 16))
-        h = max(256, min(1024, (src_h // 16) * 16))
+            src_resized = src.resize((w, h), PILImage.LANCZOS)
 
-        src_resized = src.resize((w, h), PILImage.LANCZOS)
+            # Decode mask (already 0..1 float at source resolution, white = edit region)
+            mask_np = decode_mask(mask, (src_w, src_h))
+            if mask_np.shape != (h, w):
+                mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize((w, h), PILImage.NEAREST)
+                mask_np = np.asarray(mask_img, dtype=np.float32) / 255.0
 
-        # Decode mask (already 0..1 float at source resolution, white = edit region)
-        mask_np = decode_mask(mask, (src_w, src_h))
-        if mask_np.shape != (h, w):
-            mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize((w, h), PILImage.NEAREST)
-            mask_np = np.asarray(mask_img, dtype=np.float32) / 255.0
+            coverage = float((mask_np > 0.5).mean()) * 100
+            log(
+                f"edit job={job_id} prompt={prompt!r} image={src_w}x{src_h}→{w}x{h} "
+                f"mask_coverage={coverage:.1f}% strength={strength} seed={seed} steps=50 guidance=3.5"
+            )
 
-        coverage = float((mask_np > 0.5).mean()) * 100
-        log(
-            f"edit prompt={prompt!r} image={src_w}x{src_h}→{w}x{h} "
-            f"mask_coverage={coverage:.1f}% strength={strength} seed={seed} steps=50 guidance=3.5"
-        )
+            # FluxKontextInpaintPipeline expects a PIL mask image (white = edit region).
+            mask_pil = PILImage.fromarray((mask_np * 255).astype(np.uint8), mode="L")
+            gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
 
-        # FluxKontextInpaintPipeline expects a PIL mask image (white = edit region).
-        mask_pil = PILImage.fromarray((mask_np * 255).astype(np.uint8), mode="L")
-        gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
+            num_steps = 50
+            denoise_steps = math.ceil(strength * num_steps)
+            sample_every = max(1, denoise_steps // 5)
+            t_gen = time.time()
 
-        num_steps = 50
-        denoise_steps = math.ceil(strength * num_steps)
-        sample_every = max(1, denoise_steps // 5)
-        t_gen = time.time()
-
-        def run(callback):
             result = self._pipe(
                 prompt=prompt,
                 image=src_resized,
@@ -228,19 +204,26 @@ class FluxKontext:
                 max_sequence_length=512,
                 generator=gen,
                 output_type="pil",
-                callback_on_step_end=callback,
+                callback_on_step_end=lambda pipe, i, t, kw: _progress(pipe, job_id, i, denoise_steps, sample_every, kw),
                 callback_on_step_end_tensor_inputs=["latents"],
             ).images[0]
             log(f"inference took {time.time() - t_gen:.1f}s")
+
             png = image_to_png_bytes(result.convert("RGB"))
-            return {
+            latency = (time.time() - started) * 1000
+            log(f"edit done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
+            progress_store[job_id] = {
+                "type": "result",
                 "imageUrl": encode_data_url(png),
                 "width": result.width,
                 "height": result.height,
-                "latencyMs": int((time.time() - started) * 1000),
+                "latencyMs": int(latency),
             }
-
-        yield from _stream_run(denoise_steps, sample_every, run)
+            return {"ok": True}
+        except Exception as e:
+            log(f"edit FAILED: {e}")
+            progress_store[job_id] = {"type": "error", "message": f"{e}"}
+            raise
 
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
@@ -251,32 +234,35 @@ def _warm() -> None:
 
 @app.local_entrypoint()
 def warm() -> None:
-    """Pre-download model weights: modal run flux.main:warm"""
+    """Pre-download model weights: modal run -m flux.main::warm"""
     _warm.remote()
 
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 @modal.fastapi_endpoint(method="POST")
-def web_edit(payload: dict):
-    """HTTP endpoint used by the Express API: POST /edit (SSE stream of progress + result)."""
-    from fastapi.responses import StreamingResponse
+def web_edit(payload: dict) -> dict:
+    """Start a FLUX Kontext edit asynchronously. Returns immediately; progress is polled via web_status."""
+    from fastapi import HTTPException
 
-    def gen():
-        try:
-            svc = FluxKontext()
-            for event in svc.edit.remote_gen(
-                image=payload["image"],
-                prompt=payload["prompt"],
-                mask=payload["mask"],
-                strength=payload.get("strength", 0.85),
-                seed=payload.get("seed"),
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            log(f"FLUX edit failed: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'FLUX edit failed: {e}'})}\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    job_id = payload.get("jobId")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="jobId is required")
+    try:
+        svc = FluxKontext()
+        svc.edit.spawn(
+            job_id,
+            payload["image"],
+            payload["prompt"],
+            payload["mask"],
+            payload.get("strength", 0.85),
+            payload.get("seed"),
+        )
+        log(f"edit started job={job_id}")
+        return {"accepted": True, "jobId": job_id}
+    except Exception as e:
+        log(f"FLUX edit start failed: {e}")
+        progress_store[job_id] = {"type": "error", "message": f"FLUX edit start failed: {e}"}
+        raise HTTPException(status_code=500, detail=f"FLUX edit start failed: {e}")
 
 
 @app.cls(
@@ -304,18 +290,18 @@ class FluxGenerate:
         log(f"FLUX.1-dev loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
-    def generate(self, prompt: str, seed: Optional[int] = None) -> Iterable[dict]:
+    def generate(self, job_id: str, prompt: str, seed: Optional[int] = None) -> dict:
         import torch
 
-        started = time.time()
-        total_steps = 30
-        log(f"generate prompt={prompt!r} seed={seed} steps={total_steps} guidance=3.5 (FLUX.1-dev)")
+        try:
+            started = time.time()
+            total_steps = 30
+            log(f"generate job={job_id} prompt={prompt!r} seed={seed} steps={total_steps} guidance=3.5 (FLUX.1-dev)")
 
-        gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
-        sample_every = max(1, total_steps // 6)
-        t_gen = time.time()
+            gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
+            sample_every = max(1, total_steps // 6)
+            t_gen = time.time()
 
-        def run(callback):
             result = self._pipe(
                 prompt=prompt,
                 num_inference_steps=total_steps,
@@ -323,34 +309,60 @@ class FluxGenerate:
                 max_sequence_length=512,
                 generator=gen,
                 output_type="pil",
-                callback_on_step_end=callback,
+                callback_on_step_end=lambda pipe, i, t, kw: _progress(pipe, job_id, i, total_steps, sample_every, kw),
                 callback_on_step_end_tensor_inputs=["latents"],
             ).images[0]
             log(f"inference took {time.time() - t_gen:.1f}s")
+
             png = image_to_png_bytes(result.convert("RGB"))
-            return {
+            latency = (time.time() - started) * 1000
+            log(f"generate done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
+            progress_store[job_id] = {
+                "type": "result",
                 "imageUrl": encode_data_url(png),
                 "width": result.width,
                 "height": result.height,
-                "latencyMs": int((time.time() - started) * 1000),
+                "latencyMs": int(latency),
             }
-
-        yield from _stream_run(total_steps, sample_every, run)
+            return {"ok": True}
+        except Exception as e:
+            log(f"generate FAILED: {e}")
+            progress_store[job_id] = {"type": "error", "message": f"{e}"}
+            raise
 
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 @modal.fastapi_endpoint(method="POST")
-def web_generate(payload: dict):
-    """HTTP endpoint used by the Express API: POST /generate (SSE stream of progress + result)."""
-    from fastapi.responses import StreamingResponse
+def web_generate(payload: dict) -> dict:
+    """Start FLUX.1-dev text-to-image asynchronously. Progress is polled via web_status."""
+    from fastapi import HTTPException
 
-    def gen():
-        try:
-            svc = FluxGenerate()
-            for event in svc.generate.remote_gen(prompt=payload["prompt"], seed=payload.get("seed")):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            log(f"FLUX generate failed: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'FLUX generate failed: {e}'})}\n\n"
+    job_id = payload.get("jobId")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="jobId is required")
+    try:
+        svc = FluxGenerate()
+        svc.generate.spawn(job_id, payload["prompt"], payload.get("seed"))
+        log(f"generate started job={job_id}")
+        return {"accepted": True, "jobId": job_id}
+    except Exception as e:
+        log(f"FLUX generate start failed: {e}")
+        progress_store[job_id] = {"type": "error", "message": f"FLUX generate start failed: {e}"}
+        raise HTTPException(status_code=500, detail=f"FLUX generate start failed: {e}")
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+
+@app.function(image=FLUX_IMAGE)
+@modal.fastapi_endpoint(method="POST")
+def web_status(payload: dict):
+    """Return the current progress frame for a job (or null while it warms up)."""
+    return progress_store.get(payload.get("jobId"))
+
+
+@app.function(image=FLUX_IMAGE)
+@modal.fastapi_endpoint(method="POST")
+def web_clear(payload: dict) -> dict:
+    """Drop a job's progress frame from the store once the API is done with it."""
+    job_id = payload.get("jobId")
+    if job_id and job_id in progress_store:
+        del progress_store[job_id]
+    return {"cleared": True}

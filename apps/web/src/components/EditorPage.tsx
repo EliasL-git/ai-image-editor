@@ -38,6 +38,8 @@ export default function EditorPage({ user, onLogout }: Props) {
   const [zoomPct, setZoomPct] = useState(100);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewRef = useRef<{ url: string | undefined; version: number }>({ url: undefined, version: 0 });
+  const warmStartRef = useRef<number | null>(null);
+  const [warmElapsed, setWarmElapsed] = useState(0);
 
   const { data: projectsData } = useQuery({
     queryKey: ['projects'],
@@ -108,7 +110,7 @@ export default function EditorPage({ user, onLogout }: Props) {
             previewUrl: job.previewUrl,
             previewVersion: previewRef.current.version,
           });
-          if (Date.now() - started < 5 * 60 * 1000) {
+          if (Date.now() - started < 8 * 60 * 1000) {
             pollRef.current = setTimeout(tick, JOB_POLL_INTERVAL_MS);
           } else {
             editor.setJob({ kind: 'error', message: 'Timed out waiting for the job' });
@@ -410,6 +412,25 @@ export default function EditorPage({ user, onLogout }: Props) {
   const job = editor.job;
   const running = job.kind === 'running';
   const warming = running && /modal|power|warm|cold/i.test(job.stage ?? '');
+
+  // Ticking elapsed-time clock while the Modal GPU container cold-starts.
+  useEffect(() => {
+    if (!warming) {
+      warmStartRef.current = null;
+      setWarmElapsed(0);
+      return;
+    }
+    warmStartRef.current = warmStartRef.current ?? Date.now();
+    const id = setInterval(() => {
+      if (warmStartRef.current) setWarmElapsed(Math.floor((Date.now() - warmStartRef.current) / 1000));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [warming]);
+
+  const formatElapsed = (sec: number): string => {
+    if (sec < 60) return `${sec}s`;
+    return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  };
   const statusText =
     job.kind === 'running'
       ? job.type === 'generate'
@@ -590,7 +611,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold text-on-surface">
                       {warming
-                        ? 'Waiting for Modal…'
+                        ? 'Powering up the AI…'
                         : job.kind === 'running'
                           ? job.type === 'generate'
                             ? 'Generating image…'
@@ -632,7 +653,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                       : ''}
                   </p>
                   <p className="font-mono text-[10px] text-on-surface-variant">
-                    {job.kind === 'running' ? (warming ? '…' : `${Math.round(job.progress)}%`) : ''}
+                    {job.kind === 'running' ? (warming ? formatElapsed(warmElapsed) : `${Math.round(job.progress)}%`) : ''}
                   </p>
                 </div>
               </div>
