@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import modal
@@ -8,6 +9,11 @@ import modal
 from .shared import decode_mask, encode_data_url, image_to_png_bytes, load_image
 
 app = modal.App("flux-kontext")
+
+
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    print(f"[flux {ts}] {msg}", flush=True)
 
 # Shared model volume (same one SAM uses) so weights are downloaded once.
 volume = modal.Volume.from_name("aie-models", create_if_missing=True)
@@ -35,6 +41,7 @@ def _http_error(e: Exception, label: str) -> None:
     """Raise a FastAPI error carrying the underlying failure so the API can show it."""
     from fastapi import HTTPException
 
+    log(f"{label}: {e}")
     raise HTTPException(status_code=500, detail=f"{label}: {e}")
 
 
@@ -81,24 +88,29 @@ class FluxKontext:
         from diffusers import (
             AutoencoderKL,
             FlowMatchEulerDiscreteScheduler,
-            FluxPipeline,
+            FluxKontextInpaintPipeline,
             FluxTransformer2DModel,
         )
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
         base = "/models/hf/FLUX.1-Kontext-dev"
-        print("[flux] loading Kontext Dev…")
+        t0 = time.time()
+        log("container starting — loading FLUX.1 Kontext Dev…")
         self._dtype = torch.bfloat16
 
         self._scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base, subfolder="scheduler")
         self._text_encoder = CLIPTextModel.from_pretrained(base, subfolder="text_encoder", torch_dtype=self._dtype)
+        log("  CLIP text encoder loaded")
         self._tokenizer = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer")
         self._text_encoder_2 = T5EncoderModel.from_pretrained(base, subfolder="text_encoder_2", torch_dtype=self._dtype)
         self._tokenizer_2 = T5TokenizerFast.from_pretrained(base, subfolder="tokenizer_2")
+        log("  T5 text encoder loaded")
         self._vae = AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=self._dtype)
+        log("  VAE loaded")
         self._transformer = FluxTransformer2DModel.from_pretrained(base, subfolder="transformer", torch_dtype=self._dtype)
+        log("  transformer loaded")
 
-        self._pipe = FluxPipeline(
+        self._pipe = FluxKontextInpaintPipeline(
             scheduler=self._scheduler,
             text_encoder=self._text_encoder,
             tokenizer=self._tokenizer,
@@ -107,7 +119,7 @@ class FluxKontext:
             vae=self._vae,
             transformer=self._transformer,
         ).to("cuda")
-        print("[flux] model loaded")
+        log(f"model loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
     def edit(self, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> dict:
@@ -126,32 +138,44 @@ class FluxKontext:
 
         src_resized = src.resize((w, h), PILImage.LANCZOS)
 
-        # Decode mask (already 0..1 float at source resolution), resize to target
+        # Decode mask (already 0..1 float at source resolution, white = edit region)
         mask_np = decode_mask(mask, (src_w, src_h))
         if mask_np.shape != (h, w):
             mask_img = PILImage.fromarray((mask_np * 255).astype(np.uint8)).resize((w, h), PILImage.NEAREST)
             mask_np = np.asarray(mask_img, dtype=np.float32) / 255.0
 
-        mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)  # 1,1,h,w
+        coverage = float((mask_np > 0.5).mean()) * 100
+        log(
+            f"edit prompt={prompt!r} image={src_w}x{src_h}→{w}x{h} "
+            f"mask_coverage={coverage:.1f}% strength={strength} seed={seed} steps=50 guidance=3.5"
+        )
+
+        # FluxKontextInpaintPipeline expects a PIL mask image (white = edit region).
+        mask_pil = PILImage.fromarray((mask_np * 255).astype(np.uint8), mode="L")
         gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
 
+        t_gen = time.time()
         result = self._pipe(
             prompt=prompt,
             image=src_resized,
-            mask_image=mask_t,
+            mask_image=mask_pil,
             strength=strength,
-            num_inference_steps=28,
-            guidance_scale=7.0,
+            num_inference_steps=50,
+            guidance_scale=3.5,
+            max_sequence_length=512,
             generator=gen,
             output_type="pil",
         ).images[0]
+        log(f"inference took {time.time() - t_gen:.1f}s")
 
         png = image_to_png_bytes(result.convert("RGB"))
+        latency = (time.time() - started) * 1000
+        log(f"edit done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
         return {
             "imageUrl": encode_data_url(png),
             "width": result.width,
             "height": result.height,
-            "latencyMs": int((time.time() - started) * 1000),
+            "latencyMs": int(latency),
         }
 
 
@@ -200,12 +224,13 @@ class FluxGenerate:
         import torch
         from diffusers import FluxPipeline
 
-        print("[flux] loading FLUX.1-schnell…")
+        t0 = time.time()
+        log("container starting — loading FLUX.1-schnell…")
         self._pipe = FluxPipeline.from_pretrained(
             "/models/hf/FLUX.1-schnell",
             torch_dtype=torch.bfloat16,
         ).to("cuda")
-        print("[flux] schnell loaded")
+        log(f"schnell loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
     def generate(self, prompt: str, seed: Optional[int] = None) -> dict:
@@ -214,6 +239,9 @@ class FluxGenerate:
         import torch
 
         started = time.time()
+        log(f"generate prompt={prompt!r} seed={seed} steps=4 guidance=0")
+
+        t_gen = time.time()
         gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
 
         result = self._pipe(
@@ -223,13 +251,16 @@ class FluxGenerate:
             generator=gen,
             output_type="pil",
         ).images[0]
+        log(f"inference took {time.time() - t_gen:.1f}s")
 
         png = image_to_png_bytes(result.convert("RGB"))
+        latency = (time.time() - started) * 1000
+        log(f"generate done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
         return {
             "imageUrl": encode_data_url(png),
             "width": result.width,
             "height": result.height,
-            "latencyMs": int((time.time() - started) * 1000),
+            "latencyMs": int(latency),
         }
 
 

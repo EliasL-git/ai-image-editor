@@ -30,7 +30,9 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
   if (tokenId && tokenSecret) {
     headers.authorization = `Basic ${Buffer.from(`${tokenId}:${tokenSecret}`).toString('base64')}`;
   }
+  const started = Date.now();
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const elapsed = Date.now() - started;
   if (!res.ok) {
     let message = `Modal request failed (${res.status})`;
     try {
@@ -40,9 +42,12 @@ async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSe
     } catch {
       /* keep default */
     }
+    console.log(`[modal] POST ${url} → ${res.status} (${elapsed}ms): ${message}`);
     throw new Error(message);
   }
-  return (await res.json()) as T;
+  const data = (await res.json()) as T;
+  console.log(`[modal] POST ${url} → ${res.status} (${elapsed}ms) OK`);
+  return data;
 }
 
 /** Local fallback: build a deterministic mask image (PNG data URL) from the hint. */

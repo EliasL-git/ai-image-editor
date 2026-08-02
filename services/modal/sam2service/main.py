@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import modal
@@ -12,6 +13,11 @@ from .shared import (
     load_image,
     mask_to_png_bytes,
 )
+
+
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    print(f"[sam2 {ts}] {msg}", flush=True)
 
 app = modal.App("sam2-segment")
 
@@ -77,6 +83,8 @@ class Sam2Service:
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+        t0 = time.time()
+        log("container starting — loading SAM 2.1 Large…")
         download_sam2()
         checkpoint = "/models/sam2/sam2.1_hiera_large.pt"
         # Absolute path to the hydra config inside the cloned repo; hydra resolves
@@ -84,7 +92,7 @@ class Sam2Service:
         cfg = "/opt/sam2-repo/configs/sam2.1/sam2.1_hiera_l.yaml"
         self._model = build_sam2(cfg, checkpoint, device="cuda")
         self._predictor = SAM2ImagePredictor(self._model)
-        print("[sam2] model loaded")
+        log(f"model loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
     def segment(
@@ -99,15 +107,26 @@ class Sam2Service:
         import torch
 
         started = time.time()
+        log(f"segment mode={mode} image_bytes={len(image) if isinstance(image, (bytes, bytearray)) else len(image)}")
+        if mode == "point":
+            log(f"  point={point}")
+        elif mode == "box":
+            log(f"  box={box}")
+        elif mode == "brush":
+            log(f"  brush_points={len(points or [])}")
+
         img = load_image(image)
         w, h = img.size
-        arr = np.asarray(img)
+        log(f"image {w}x{h}")
 
-        self._predictor.set_image(arr)
+        t_set = time.time()
+        self._predictor.set_image(np.asarray(img))
+        log(f"set_image in {(time.time() - t_set) * 1000:.0f}ms")
 
         if mode == "point" and point is not None:
             x = int(point["x"] * w)
             y = int(point["y"] * h)
+            log(f"  prompt point=({x},{y})")
             masks, scores, _ = self._predictor.predict(
                 point_coords=np.array([[x, y]]),
                 point_labels=np.array([1]),
@@ -115,6 +134,7 @@ class Sam2Service:
             )
         elif mode == "box" and box is not None:
             x0, y0, x1, y1 = box
+            log(f"  prompt box=({x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f}) → px=({x0*w:.0f},{y0*h:.0f},{x1*w:.0f},{y1*h:.0f})")
             masks, scores, _ = self._predictor.predict(
                 point_coords=None,
                 box=np.array([[x0 * w, y0 * h, x1 * w, y1 * h]]),
@@ -123,6 +143,7 @@ class Sam2Service:
         elif mode == "brush" and points is not None:
             coords = np.array([[p["x"] * w, p["y"] * h] for p in points])
             labels = np.ones(len(coords), dtype=np.int32)
+            log(f"  prompt brush coords={coords.tolist()}")
             masks, scores, _ = self._predictor.predict(
                 point_coords=coords,
                 point_labels=labels,
@@ -134,16 +155,20 @@ class Sam2Service:
         # Pick highest-scoring mask
         best = int(np.argmax(scores))
         mask = masks[best].astype(np.float32)
+        coverage = float((mask > 0.5).mean()) * 100
+        log(f"predict done — {len(scores)} masks, best score={float(scores[best]):.3f}, mask coverage={coverage:.1f}%")
 
         # Feather edges slightly for natural blending
         mask = _feather(mask, radius=2)
 
         mask_img = mask_to_png_bytes(mask)
+        latency = (time.time() - started) * 1000
+        log(f"segment done in {latency:.0f}ms → mask {w}x{h} ({len(mask_img)} bytes)")
         return {
             "maskUrl": encode_data_url(mask_img),
             "maskWidth": w,
             "maskHeight": h,
-            "latencyMs": int((time.time() - started) * 1000),
+            "latencyMs": int(latency),
         }
 
 

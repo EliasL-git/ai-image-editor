@@ -65,6 +65,7 @@ export default function EditorPage({ user, onLogout }: Props) {
         try {
           const { job } = await api.job(jobId);
           if (job.status === 'succeeded') {
+            console.info(`[job ${jobId}] ${type} succeeded → ${job.outputUrl}`);
             if (type === 'segment') {
               editor.setJob({ kind: 'done', type, jobId });
               editor.setMask(job.outputUrl ?? null);
@@ -86,11 +87,13 @@ export default function EditorPage({ user, onLogout }: Props) {
             return;
           }
           if (job.status === 'failed' || job.status === 'canceled') {
+            console.error(`[job ${jobId}] ${type} failed: ${job.error ?? 'unknown'}`);
             editor.setJob({ kind: 'error', message: job.error ?? 'Job failed' });
             setError(job.error ?? 'Job failed');
             setBusy(false);
             return;
           }
+          console.info(`[job ${jobId}] ${type} ${job.status} ${job.progress}% — ${job.stage ?? ''}`);
           editor.setJob({
             kind: 'running',
             type,
@@ -562,11 +565,45 @@ export default function EditorPage({ user, onLogout }: Props) {
           )}
 
           {running && (
-            <div className="absolute right-3 top-3 z-20 flex items-center gap-2 rounded-full border border-outline-variant bg-surface-container-lowest/80 px-3 py-1 text-xs backdrop-blur-md">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
-              <span className="text-on-surface-variant">
-                {statusText}… {job.kind === 'running' ? `${Math.round(job.progress)}%` : ''}
-              </span>
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/50 backdrop-blur-[2px]">
+              <div className="animate-fade-in w-80 rounded-2xl border border-outline-variant bg-surface p-5 shadow-2xl">
+                <div className="flex items-center gap-3">
+                  <div className="relative flex h-10 w-10 shrink-0 items-center justify-center">
+                    <span className="absolute inset-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+                    <span className="ms !text-lg text-primary">auto_fix_high</span>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-on-surface">
+                      {job.kind === 'running'
+                        ? job.type === 'generate'
+                          ? 'Generating image…'
+                          : job.type === 'segment'
+                            ? 'Selecting object…'
+                            : 'Editing image…'
+                        : ''}
+                    </p>
+                    <p className="truncate text-xs text-on-surface-variant">
+                      {job.kind === 'running' ? job.stage : ''}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-surface-container-highest">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all duration-500"
+                    style={{
+                      width: `${job.kind === 'running' ? Math.min(100, Math.max(5, job.progress)) : 0}%`,
+                    }}
+                  />
+                </div>
+                <div className="mt-2 flex items-center justify-between">
+                  <p className="font-mono text-[10px] uppercase tracking-wider text-on-surface-variant">
+                    {job.kind === 'running' && job.type === 'generate' ? 'Text-to-image' : job.kind === 'running' && job.type === 'segment' ? 'SAM 2' : 'FLUX Kontext'}
+                  </p>
+                  <p className="font-mono text-[10px] text-on-surface-variant">
+                    {job.kind === 'running' ? `${Math.round(job.progress)}%` : ''}
+                  </p>
+                </div>
+              </div>
             </div>
           )}
 
@@ -690,7 +727,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                       className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-xs font-bold text-on-primary transition hover:bg-on-surface hover:text-surface disabled:opacity-50"
                     >
                       <span className="ms !text-base">auto_fix_high</span>
-                      Generate
+                      {job.kind === 'running' && job.type === 'edit' ? 'Generating…' : 'Generate'}
                     </button>
                     {job.kind === 'done' && job.type === 'edit' && (
                       <div className="flex gap-2">
@@ -727,7 +764,7 @@ export default function EditorPage({ user, onLogout }: Props) {
                         className="flex w-full items-center justify-center gap-2 rounded-lg border border-primary/60 py-2.5 text-xs font-bold text-primary transition hover:bg-primary/10 disabled:opacity-50"
                       >
                         <span className="ms !text-base">magic_button</span>
-                        Generate from scratch
+                        {job.kind === 'running' && job.type === 'generate' ? 'Generating…' : 'Generate from scratch'}
                       </button>
                     </div>
                   </div>

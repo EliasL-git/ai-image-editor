@@ -30,6 +30,24 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ---------------------------------------------------------------------------
+// Request logging
+// ---------------------------------------------------------------------------
+function log(level: string, msg: string): void {
+  const t = new Date().toISOString();
+  console.log(`[${t}] [${level}] ${msg}`);
+}
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const started = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - started;
+    const size = (res.getHeader('content-length') as string) ?? '-';
+    log('http', `${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms, ${size}b)`);
+  });
+  next();
+});
+
+// ---------------------------------------------------------------------------
 // Static asset serving (uploads, masks, results, exports)
 // ---------------------------------------------------------------------------
 app.use('/uploads', express.static(path.join(config.dataDir, 'uploads')));
@@ -125,25 +143,30 @@ app.post('/segment', requireAuth, async (req: Request, res: Response) => {
     stage: 'queued',
     input: { imageId, mode, point, box, points },
   });
+  log('job', `[${job.id}] segment queued image=${imageId} mode=${mode}`);
 
   void (async () => {
+    const started = Date.now();
     try {
-      updateJob(job.id, { status: 'running', progress: 40, stage: 'running SAM 2' });
+      updateJob(job.id, { status: 'running', progress: 40, stage: 'Segmenting object…' });
+      log('job', `[${job.id}] segment running…`);
       const result = await requestSegment({ imageId, mode, point, box, points });
       let maskUrl = result.maskUrl;
       if (maskUrl.startsWith('data:')) {
         const saved = await saveMask(maskUrl);
         maskUrl = saved.url;
       }
-      updateJob(job.id, { stage: 'saving mask' });
+      updateJob(job.id, { stage: 'Finalizing…' });
       completeJob(job.id, {
         maskUrl,
         maskWidth: result.maskWidth,
         maskHeight: result.maskHeight,
         latencyMs: result.latencyMs,
       });
+      log('job', `[${job.id}] segment done in ${Date.now() - started}ms → ${maskUrl} (${result.maskWidth}x${result.maskHeight})`);
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
+      log('job', `[${job.id}] segment FAILED: ${(err as Error).message}`);
     }
   })();
 
@@ -165,22 +188,27 @@ app.post('/edit', requireAuth, async (req: Request, res: Response) => {
     stage: 'queued',
     input: { imageId, prompt, mask, strength, seed },
   });
+  log('job', `[${job.id}] edit queued image=${imageId} prompt=${JSON.stringify(prompt)} strength=${strength ?? 0.85}`);
 
   void (async () => {
+    const started = Date.now();
     try {
-      updateJob(job.id, { status: 'running', progress: 30, stage: 'starting FLUX Kontext' });
+      updateJob(job.id, { status: 'running', progress: 30, stage: 'Starting AI edit…' });
       const sourceUrl = await resolveSourceUrl(imageId);
-      updateJob(job.id, { progress: 50, stage: 'generating edit' });
+      updateJob(job.id, { progress: 50, stage: 'Editing image…' });
+      log('job', `[${job.id}] edit running → FLUX (source=${sourceUrl})`);
       const result = await requestEdit({ imageId, prompt, mask, strength, seed, imageUrl: sourceUrl });
       let imageUrl = result.imageUrl;
       if (imageUrl.startsWith('data:')) {
         const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
         imageUrl = saved.url;
       }
-      updateJob(job.id, { stage: 'saving result' });
+      updateJob(job.id, { stage: 'Finalizing…' });
       completeJob(job.id, { imageUrl, width: result.width, height: result.height, latencyMs: result.latencyMs });
+      log('job', `[${job.id}] edit done in ${Date.now() - started}ms → ${imageUrl} (${result.width}x${result.height})`);
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
+      log('job', `[${job.id}] edit FAILED: ${(err as Error).message}`);
     }
   })();
 
@@ -202,20 +230,25 @@ app.post('/generate', requireAuth, async (req: Request, res: Response) => {
     stage: 'queued',
     input: { prompt, seed },
   });
+  log('job', `[${job.id}] generate queued prompt=${JSON.stringify(prompt)}`);
 
   void (async () => {
+    const started = Date.now();
     try {
-      updateJob(job.id, { status: 'running', progress: 30, stage: 'starting FLUX.1-schnell' });
+      updateJob(job.id, { status: 'running', progress: 30, stage: 'Starting generation…' });
+      log('job', `[${job.id}] generate running → FLUX.1-schnell`);
       const result = await requestGenerate({ prompt, seed });
       let imageUrl = result.imageUrl;
       if (imageUrl.startsWith('data:')) {
         const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
         imageUrl = saved.url;
       }
-      updateJob(job.id, { stage: 'saving result' });
+      updateJob(job.id, { stage: 'Finalizing…' });
       completeJob(job.id, { imageUrl, width: result.width, height: result.height, latencyMs: result.latencyMs });
+      log('job', `[${job.id}] generate done in ${Date.now() - started}ms → ${imageUrl} (${result.width}x${result.height})`);
     } catch (err) {
       updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
+      log('job', `[${job.id}] generate FAILED: ${(err as Error).message}`);
     }
   })();
 
