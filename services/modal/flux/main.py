@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import math
+import queue
+import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -37,14 +42,6 @@ FLUX_IMAGE = (
 )
 
 
-def _http_error(e: Exception, label: str) -> None:
-    """Raise a FastAPI error carrying the underlying failure so the API can show it."""
-    from fastapi import HTTPException
-
-    log(f"{label}: {e}")
-    raise HTTPException(status_code=500, detail=f"{label}: {e}")
-
-
 def download_flux() -> None:
     """Ensure the FLUX Kontext Dev weights are cached on the volume."""
     import os
@@ -58,17 +55,78 @@ def download_flux() -> None:
     )
 
 
-def download_flux_schnell() -> None:
-    """Ensure the FLUX.1-schnell (text-to-image) weights are cached on the volume."""
+def download_flux_dev() -> None:
+    """Ensure the FLUX.1-dev (text-to-image) weights are cached on the volume."""
     import os
 
     os.makedirs("/models/hf", exist_ok=True)
     from huggingface_hub import snapshot_download
 
     snapshot_download(
-        "black-forest-labs/FLUX.1-schnell",
-        local_dir="/models/hf/FLUX.1-schnell",
+        "black-forest-labs/FLUX.1-dev",
+        local_dir="/models/hf/FLUX.1-dev",
     )
+
+
+def _decode_latents(pipe, latents, max_size: int = 288):
+    """Decode denoising latents into a small PIL preview (mirrors final pipeline decode)."""
+    import torch
+    from PIL import Image as PILImage
+
+    with torch.no_grad():
+        image = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
+    pil = pipe.image_processor.postprocess(image, output_type="pil")[0].convert("RGB")
+    if max(pil.size) > max_size:
+        pil = pil.resize((max_size, max_size), PILImage.LANCZOS)
+    return pil
+
+
+def _stream_run(total_steps: int, sample_every: int, run) -> Iterable[dict]:
+    """Run the pipe call in a background thread, streaming progress + final events.
+
+    Each yielded dict is one of:
+      {"type": "progress", "progress", "step", "total", "stage", "preview"}
+      {"type": "result", "imageUrl", "width", "height", "latencyMs"}
+      {"type": "error", "message"}
+    """
+    q: queue.Queue = queue.Queue()
+
+    def on_step(pipe, step_index, timestep, callback_kwargs):
+        if step_index % sample_every == 0:
+            try:
+                pil = _decode_latents(pipe, callback_kwargs["latents"])
+                png = image_to_png_bytes(pil)
+                progress = round(35 + 60 * ((step_index + 1) / total_steps))
+                q.put(
+                    {
+                        "type": "progress",
+                        "progress": progress,
+                        "step": step_index,
+                        "total": total_steps,
+                        "stage": f"step {step_index + 1}/{total_steps}",
+                        "preview": encode_data_url(png),
+                    }
+                )
+            except Exception as e:
+                log(f"preview decode failed: {e}")
+        return callback_kwargs
+
+    def worker():
+        try:
+            result = run(on_step)
+            q.put({"type": "result", **result})
+        except Exception as e:
+            log(f"inference failed: {e}")
+            q.put({"type": "error", "message": f"{e}"})
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
 
 
 @app.cls(
@@ -122,7 +180,7 @@ class FluxKontext:
         log(f"model loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
-    def edit(self, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> dict:
+    def edit(self, image: str | bytes, prompt: str, mask: str, strength: float = 0.85, seed: Optional[int] = None) -> Iterable[dict]:
         import numpy as np
         import torch
         from PIL import Image as PILImage
@@ -154,35 +212,41 @@ class FluxKontext:
         mask_pil = PILImage.fromarray((mask_np * 255).astype(np.uint8), mode="L")
         gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
 
+        num_steps = 50
+        denoise_steps = math.ceil(strength * num_steps)
+        sample_every = max(1, denoise_steps // 5)
         t_gen = time.time()
-        result = self._pipe(
-            prompt=prompt,
-            image=src_resized,
-            mask_image=mask_pil,
-            strength=strength,
-            num_inference_steps=50,
-            guidance_scale=3.5,
-            max_sequence_length=512,
-            generator=gen,
-            output_type="pil",
-        ).images[0]
-        log(f"inference took {time.time() - t_gen:.1f}s")
 
-        png = image_to_png_bytes(result.convert("RGB"))
-        latency = (time.time() - started) * 1000
-        log(f"edit done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
-        return {
-            "imageUrl": encode_data_url(png),
-            "width": result.width,
-            "height": result.height,
-            "latencyMs": int(latency),
-        }
+        def run(callback):
+            result = self._pipe(
+                prompt=prompt,
+                image=src_resized,
+                mask_image=mask_pil,
+                strength=strength,
+                num_inference_steps=num_steps,
+                guidance_scale=3.5,
+                max_sequence_length=512,
+                generator=gen,
+                output_type="pil",
+                callback_on_step_end=callback,
+                callback_on_step_end_tensor_inputs=["latents"],
+            ).images[0]
+            log(f"inference took {time.time() - t_gen:.1f}s")
+            png = image_to_png_bytes(result.convert("RGB"))
+            return {
+                "imageUrl": encode_data_url(png),
+                "width": result.width,
+                "height": result.height,
+                "latencyMs": int((time.time() - started) * 1000),
+            }
+
+        yield from _stream_run(denoise_steps, sample_every, run)
 
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 def _warm() -> None:
     download_flux()
-    download_flux_schnell()
+    download_flux_dev()
 
 
 @app.local_entrypoint()
@@ -193,19 +257,26 @@ def warm() -> None:
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 @modal.fastapi_endpoint(method="POST")
-def web_edit(payload: dict) -> dict:
-    """HTTP endpoint used by the Express API: POST /edit (JSON body)"""
-    try:
-        svc = FluxKontext()
-        return svc.edit.remote(
-            image=payload["image"],
-            prompt=payload["prompt"],
-            mask=payload["mask"],
-            strength=payload.get("strength", 0.85),
-            seed=payload.get("seed"),
-        )
-    except Exception as e:
-        _http_error(e, "FLUX edit failed")
+def web_edit(payload: dict):
+    """HTTP endpoint used by the Express API: POST /edit (SSE stream of progress + result)."""
+    from fastapi.responses import StreamingResponse
+
+    def gen():
+        try:
+            svc = FluxKontext()
+            for event in svc.edit.remote_gen(
+                image=payload["image"],
+                prompt=payload["prompt"],
+                mask=payload["mask"],
+                strength=payload.get("strength", 0.85),
+                seed=payload.get("seed"),
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            log(f"FLUX edit failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': f'FLUX edit failed: {e}'})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.cls(
@@ -225,51 +296,61 @@ class FluxGenerate:
         from diffusers import FluxPipeline
 
         t0 = time.time()
-        log("container starting — loading FLUX.1-schnell…")
+        log("container starting — loading FLUX.1-dev…")
         self._pipe = FluxPipeline.from_pretrained(
-            "/models/hf/FLUX.1-schnell",
+            "/models/hf/FLUX.1-dev",
             torch_dtype=torch.bfloat16,
         ).to("cuda")
-        log(f"schnell loaded in {time.time() - t0:.1f}s")
+        log(f"FLUX.1-dev loaded in {time.time() - t0:.1f}s")
 
     @modal.method()
-    def generate(self, prompt: str, seed: Optional[int] = None) -> dict:
-        import time
-
+    def generate(self, prompt: str, seed: Optional[int] = None) -> Iterable[dict]:
         import torch
 
         started = time.time()
-        log(f"generate prompt={prompt!r} seed={seed} steps=4 guidance=0")
+        total_steps = 30
+        log(f"generate prompt={prompt!r} seed={seed} steps={total_steps} guidance=3.5 (FLUX.1-dev)")
 
-        t_gen = time.time()
         gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
+        sample_every = max(1, total_steps // 6)
+        t_gen = time.time()
 
-        result = self._pipe(
-            prompt=prompt,
-            num_inference_steps=4,
-            guidance_scale=0.0,
-            generator=gen,
-            output_type="pil",
-        ).images[0]
-        log(f"inference took {time.time() - t_gen:.1f}s")
+        def run(callback):
+            result = self._pipe(
+                prompt=prompt,
+                num_inference_steps=total_steps,
+                guidance_scale=3.5,
+                max_sequence_length=512,
+                generator=gen,
+                output_type="pil",
+                callback_on_step_end=callback,
+                callback_on_step_end_tensor_inputs=["latents"],
+            ).images[0]
+            log(f"inference took {time.time() - t_gen:.1f}s")
+            png = image_to_png_bytes(result.convert("RGB"))
+            return {
+                "imageUrl": encode_data_url(png),
+                "width": result.width,
+                "height": result.height,
+                "latencyMs": int((time.time() - started) * 1000),
+            }
 
-        png = image_to_png_bytes(result.convert("RGB"))
-        latency = (time.time() - started) * 1000
-        log(f"generate done in {latency:.0f}ms → {result.width}x{result.height} ({len(png)} bytes)")
-        return {
-            "imageUrl": encode_data_url(png),
-            "width": result.width,
-            "height": result.height,
-            "latencyMs": int(latency),
-        }
+        yield from _stream_run(total_steps, sample_every, run)
 
 
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 @modal.fastapi_endpoint(method="POST")
-def web_generate(payload: dict) -> dict:
-    """HTTP endpoint used by the Express API: POST /generate (JSON body)"""
-    try:
-        svc = FluxGenerate()
-        return svc.generate.remote(prompt=payload["prompt"], seed=payload.get("seed"))
-    except Exception as e:
-        _http_error(e, "FLUX generate failed")
+def web_generate(payload: dict):
+    """HTTP endpoint used by the Express API: POST /generate (SSE stream of progress + result)."""
+    from fastapi.responses import StreamingResponse
+
+    def gen():
+        try:
+            svc = FluxGenerate()
+            for event in svc.generate.remote_gen(prompt=payload["prompt"], seed=payload.get("seed")):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            log(f"FLUX generate failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': f'FLUX generate failed: {e}'})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")

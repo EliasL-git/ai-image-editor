@@ -4,7 +4,17 @@ import type { StrokeHint } from '@aie/canvas';
 
 export type JobState =
   | { kind: 'idle' }
-  | { kind: 'running'; type: 'segment' | 'edit' | 'generate'; stage: string; progress: number; jobId: string }
+  | {
+      kind: 'running';
+      type: 'segment' | 'edit' | 'generate';
+      stage: string;
+      progress: number;
+      jobId: string;
+      /** Live preview frame URL (streamed from Modal). */
+      previewUrl?: string;
+      /** Bumped whenever previewUrl changes so the <img> refetches it. */
+      previewVersion?: number;
+    }
   | { kind: 'done'; type: 'segment' | 'edit' | 'generate'; jobId: string }
   | { kind: 'error'; message: string };
 

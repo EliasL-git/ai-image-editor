@@ -55,6 +55,8 @@ export interface Job {
   stage?: string; // human-readable status detail, e.g. 'warming up GPU'
   input: SegmentJobInput | EditJobInput | GenerateJobInput;
   outputUrl?: string;
+  /** Live preview of the image being generated/edited (streamed from Modal). */
+  previewUrl?: string;
   error?: string;
   createdAt: string;
   updatedAt: string;

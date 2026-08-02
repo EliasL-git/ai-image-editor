@@ -79,6 +79,19 @@ export async function saveExport(buffer: Buffer, ext: string): Promise<string> {
   return publicUrl(`/exports/${filename}`);
 }
 
+/**
+ * Save a streamed preview frame (data URL) to a deterministic per-job file.
+ * Overwrites on each frame so a job keeps exactly one preview on disk.
+ */
+export async function savePreview(jobId: string, dataUrl: string): Promise<string> {
+  const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
+  const buffer = Buffer.from(base64, 'base64');
+  const resized = await sharp(buffer).resize({ width: 384, withoutEnlargement: true }).png().toBuffer();
+  const filename = `${jobId}.preview.png`;
+  fs.writeFileSync(path.join(dirs.resultsDir, filename), resized);
+  return publicUrl(`/results/${filename}`);
+}
+
 export function mimeToExt(mime: string): string {
   switch (mime) {
     case 'image/png':

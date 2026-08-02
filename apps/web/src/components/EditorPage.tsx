@@ -37,6 +37,7 @@ export default function EditorPage({ user, onLogout }: Props) {
   const [tab, setTab] = useState<InspectorTab>('properties');
   const [zoomPct, setZoomPct] = useState(100);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewRef = useRef<{ url: string | undefined; version: number }>({ url: undefined, version: 0 });
 
   const { data: projectsData } = useQuery({
     queryKey: ['projects'],
@@ -94,12 +95,18 @@ export default function EditorPage({ user, onLogout }: Props) {
             return;
           }
           console.info(`[job ${jobId}] ${type} ${job.status} ${job.progress}% — ${job.stage ?? ''}`);
+          if (job.previewUrl && job.previewUrl !== previewRef.current.url) {
+            previewRef.current.url = job.previewUrl;
+            previewRef.current.version += 1;
+          }
           editor.setJob({
             kind: 'running',
             type,
             stage: job.stage ?? 'working',
             progress: job.progress,
             jobId,
+            previewUrl: job.previewUrl,
+            previewVersion: previewRef.current.version,
           });
           if (Date.now() - started < 5 * 60 * 1000) {
             pollRef.current = setTimeout(tick, JOB_POLL_INTERVAL_MS);
@@ -402,6 +409,7 @@ export default function EditorPage({ user, onLogout }: Props) {
 
   const job = editor.job;
   const running = job.kind === 'running';
+  const warming = running && /modal|power|warm|cold/i.test(job.stage ?? '');
   const statusText =
     job.kind === 'running'
       ? job.type === 'generate'
@@ -566,41 +574,65 @@ export default function EditorPage({ user, onLogout }: Props) {
 
           {running && (
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-background/50 backdrop-blur-[2px]">
-              <div className="animate-fade-in w-80 rounded-2xl border border-outline-variant bg-surface p-5 shadow-2xl">
+              <div className="animate-fade-in w-96 rounded-2xl border border-outline-variant bg-surface p-5 shadow-2xl">
                 <div className="flex items-center gap-3">
                   <div className="relative flex h-10 w-10 shrink-0 items-center justify-center">
-                    <span className="absolute inset-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+                    {warming ? (
+                      <>
+                        <span className="absolute inset-0 animate-pulse rounded-full bg-primary/20" />
+                        <span className="ms !text-xl text-primary">bolt</span>
+                      </>
+                    ) : (
+                      <span className="absolute inset-0 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+                    )}
                     <span className="ms !text-lg text-primary">auto_fix_high</span>
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold text-on-surface">
-                      {job.kind === 'running'
-                        ? job.type === 'generate'
-                          ? 'Generating image…'
-                          : job.type === 'segment'
-                            ? 'Selecting object…'
-                            : 'Editing image…'
-                        : ''}
+                      {warming
+                        ? 'Waiting for Modal…'
+                        : job.kind === 'running'
+                          ? job.type === 'generate'
+                            ? 'Generating image…'
+                            : job.type === 'segment'
+                              ? 'Selecting object…'
+                              : 'Editing image…'
+                          : ''}
                     </p>
                     <p className="truncate text-xs text-on-surface-variant">
                       {job.kind === 'running' ? job.stage : ''}
                     </p>
                   </div>
+                  {job.kind === 'running' && job.previewUrl && (
+                    <img
+                      src={`${job.previewUrl}?v=${job.previewVersion ?? 0}`}
+                      alt="live preview"
+                      className="h-16 w-16 shrink-0 rounded-lg border border-outline-variant object-cover"
+                    />
+                  )}
                 </div>
                 <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-surface-container-highest">
                   <div
-                    className="h-full rounded-full bg-primary transition-all duration-500"
+                    className={`h-full rounded-full transition-all duration-500 ${warming ? 'animate-pulse bg-primary' : 'bg-primary'}`}
                     style={{
-                      width: `${job.kind === 'running' ? Math.min(100, Math.max(5, job.progress)) : 0}%`,
+                      width: `${job.kind === 'running' ? (warming ? 12 : Math.min(100, Math.max(5, job.progress))) : 0}%`,
                     }}
                   />
                 </div>
                 <div className="mt-2 flex items-center justify-between">
                   <p className="font-mono text-[10px] uppercase tracking-wider text-on-surface-variant">
-                    {job.kind === 'running' && job.type === 'generate' ? 'Text-to-image' : job.kind === 'running' && job.type === 'segment' ? 'SAM 2' : 'FLUX Kontext'}
+                    {job.kind === 'running'
+                      ? warming
+                        ? 'GPU cold start'
+                        : job.type === 'generate'
+                          ? 'FLUX.1-dev'
+                          : job.type === 'segment'
+                            ? 'SAM 2'
+                            : 'FLUX Kontext'
+                      : ''}
                   </p>
                   <p className="font-mono text-[10px] text-on-surface-variant">
-                    {job.kind === 'running' ? `${Math.round(job.progress)}%` : ''}
+                    {job.kind === 'running' ? (warming ? '…' : `${Math.round(job.progress)}%`) : ''}
                   </p>
                 </div>
               </div>
