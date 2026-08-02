@@ -49,11 +49,11 @@ export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancele
 export interface Job {
   id: string;
   userId: string;
-  type: 'segment' | 'edit';
+  type: 'segment' | 'edit' | 'generate';
   status: JobStatus;
   progress: number; // 0..100 heuristic
   stage?: string; // human-readable status detail, e.g. 'warming up GPU'
-  input: SegmentJobInput | EditJobInput;
+  input: SegmentJobInput | EditJobInput | GenerateJobInput;
   outputUrl?: string;
   error?: string;
   createdAt: string;
@@ -81,6 +81,11 @@ export interface EditJobInput {
   seed?: number;
 }
 
+export interface GenerateJobInput {
+  prompt: string;
+  seed?: number;
+}
+
 export interface SegmentJobResult {
   maskUrl: string;
   maskWidth: number;
@@ -95,7 +100,14 @@ export interface EditJobResult {
   latencyMs: number;
 }
 
-export type JobResult = SegmentJobResult | EditJobResult;
+export type JobResult = SegmentJobResult | EditJobResult | GenerateJobResult;
+
+export interface GenerateJobResult {
+  imageUrl: string;
+  width: number;
+  height: number;
+  latencyMs: number;
+}
 
 export interface JobResponse {
   job: Job;

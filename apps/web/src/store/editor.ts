@@ -4,8 +4,8 @@ import type { StrokeHint } from '@aie/canvas';
 
 export type JobState =
   | { kind: 'idle' }
-  | { kind: 'running'; type: 'segment' | 'edit'; stage: string; progress: number; jobId: string }
-  | { kind: 'done'; type: 'segment' | 'edit'; jobId: string }
+  | { kind: 'running'; type: 'segment' | 'edit' | 'generate'; stage: string; progress: number; jobId: string }
+  | { kind: 'done'; type: 'segment' | 'edit' | 'generate'; jobId: string }
   | { kind: 'error'; message: string };
 
 export interface EditorState {

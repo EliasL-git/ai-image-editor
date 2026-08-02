@@ -22,6 +22,9 @@ export interface EditResponse {
   latencyMs: number;
 }
 
+/** Text-to-image response shape (same as edit). */
+export type GenerateResponse = EditResponse;
+
 async function postJson<T>(url: string, body: unknown, tokenId?: string, tokenSecret?: string): Promise<T> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (tokenId && tokenSecret) {
@@ -93,6 +96,16 @@ async function fallbackEdit(input: EditJobInput & { imageUrl: string }): Promise
   return { imageUrl, width: 1024, height: 1024, latencyMs: 80 };
 }
 
+/** Local fallback: a deterministic placeholder so the flow is testable offline. */
+function fallbackGenerate(prompt: string): GenerateResponse {
+  // 1x1 transparent PNG (data URL) is cheap and lets the canvas load it.
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    'base64',
+  );
+  return { imageUrl: `data:image/png;base64,${png.toString('base64')}`, width: 1024, height: 1024, latencyMs: 80 };
+}
+
 /** Read a stored asset as a base64 data URL so Modal can fetch it remotely. */
 async function assetToDataUrl(urlOrId: string): Promise<string> {
   // Already a data URL or a fully qualified http(s) URL — pass through.
@@ -127,7 +140,7 @@ async function uploadIdToDataUrl(imageId: string): Promise<string> {
 export async function requestSegment(input: SegmentJobInput): Promise<SegmentResponse> {
   if (isLocalFallback() || !config.modalSamUrl) {
     const mask = await fallbackMask(input);
-    return { ...mask, latencyMs: 120 };
+    return { maskUrl: mask.url, maskWidth: mask.width, maskHeight: mask.height, latencyMs: 120 };
   }
   const image = await uploadIdToDataUrl(input.imageId);
   const res = await postJson<SegmentResponse>(
@@ -154,6 +167,19 @@ export async function requestEdit(input: EditJobInput & { imageUrl: string }): P
       strength: input.strength ?? 0.85,
       seed: input.seed,
     },
+    config.modalTokenId,
+    config.modalTokenSecret,
+  );
+  return res;
+}
+
+export async function requestGenerate(input: { prompt: string; seed?: number }): Promise<GenerateResponse> {
+  if (isLocalFallback() || !config.modalGenerateUrl) {
+    return fallbackGenerate(input.prompt);
+  }
+  const res = await postJson<GenerateResponse>(
+    config.modalGenerateUrl.replace(/\/$/, ''),
+    { prompt: input.prompt, seed: input.seed },
     config.modalTokenId,
     config.modalTokenSecret,
   );

@@ -20,7 +20,7 @@ import {
   type StoredUser,
 } from './store.js';
 import { upload, saveUpload, saveMask, saveResult, saveExport, readFileByUrl } from './uploads.js';
-import { requestSegment, requestEdit } from './modal.js';
+import { requestSegment, requestEdit, requestGenerate } from './modal.js';
 import { isLocalFallback, publicUrl } from './config.js';
 import type { User } from '@aie/types';
 
@@ -172,6 +172,41 @@ app.post('/edit', requireAuth, async (req: Request, res: Response) => {
       const sourceUrl = await resolveSourceUrl(imageId);
       updateJob(job.id, { progress: 50, stage: 'generating edit' });
       const result = await requestEdit({ imageId, prompt, mask, strength, seed, imageUrl: sourceUrl });
+      let imageUrl = result.imageUrl;
+      if (imageUrl.startsWith('data:')) {
+        const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));
+        imageUrl = saved.url;
+      }
+      updateJob(job.id, { stage: 'saving result' });
+      completeJob(job.id, { imageUrl, width: result.width, height: result.height, latencyMs: result.latencyMs });
+    } catch (err) {
+      updateJob(job.id, { status: 'failed', stage: 'failed', error: (err as Error).message });
+    }
+  })();
+
+  res.status(202).json({ job });
+});
+
+app.post('/generate', requireAuth, async (req: Request, res: Response) => {
+  const user = userOf(res);
+  const { prompt, seed } = req.body ?? {};
+  if (typeof prompt !== 'string' || !prompt.trim()) {
+    res.status(400).json({ error: 'prompt is required' });
+    return;
+  }
+  const job = createJob({
+    userId: user.id,
+    type: 'generate',
+    status: 'queued',
+    progress: 5,
+    stage: 'queued',
+    input: { prompt, seed },
+  });
+
+  void (async () => {
+    try {
+      updateJob(job.id, { status: 'running', progress: 30, stage: 'starting FLUX.1-schnell' });
+      const result = await requestGenerate({ prompt, seed });
       let imageUrl = result.imageUrl;
       if (imageUrl.startsWith('data:')) {
         const saved = await saveResult(Buffer.from(imageUrl.split(',')[1] ?? '', 'base64'));

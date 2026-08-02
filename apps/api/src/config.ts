@@ -29,6 +29,10 @@ export const config = {
   // Modal endpoints (empty => local fallback mode)
   modalSamUrl: process.env.MODAL_SAM_URL ?? '',
   modalFluxUrl: process.env.MODAL_FLUX_URL ?? '',
+  // Text-to-image endpoint; derived from the flux URL when unset.
+  modalGenerateUrl:
+    process.env.MODAL_GENERATE_URL ??
+    (process.env.MODAL_FLUX_URL ? process.env.MODAL_FLUX_URL.replace(/web-edit/, 'web-generate') : ''),
   modalTokenId: process.env.MODAL_TOKEN_ID ?? '',
   modalTokenSecret: process.env.MODAL_TOKEN_SECRET ?? '',
 
@@ -38,7 +42,7 @@ export const config = {
 } as const;
 
 export function isLocalFallback(): boolean {
-  return !config.modalSamUrl && !config.modalFluxUrl;
+  return !config.modalSamUrl && !config.modalFluxUrl && !config.modalGenerateUrl;
 }
 
 /**

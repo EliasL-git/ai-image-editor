@@ -36,6 +36,7 @@ export class EditorCanvas {
   private strokePoints: Point[] = [];
   private startPoint: Point | null = null;
   private lastPan: Point | null = null;
+  private isPanning = false;
   private cb: CanvasCallbacks;
   private disposed = false;
 
@@ -85,6 +86,11 @@ export class EditorCanvas {
     return this.setBaseImage(url);
   }
 
+  getImageSize(): { width: number; height: number } | null {
+    if (!this.image) return null;
+    return { width: this.image.width ?? 0, height: this.image.height ?? 0 };
+  }
+
   /** Show the SAM mask overlay (already sized to image). */
   async setMaskOverlay(maskUrl: string): Promise<void> {
     const img = await fabric.Image.fromURL(maskUrl, { crossOrigin: 'anonymous' });
@@ -101,8 +107,8 @@ export class EditorCanvas {
     });
     img.applyFilters();
     this.canvas.add(img);
-    img.sendToBack();
-    this.overlay.moveTo(1);
+    this.canvas.sendObjectToBack(img);
+    this.canvas.moveObjectTo(this.overlay, 1);
     this.render();
   }
 
@@ -232,7 +238,7 @@ export class EditorCanvas {
         });
         this.addToDrawLayer(this.currentPolyline);
       } else if (tool === 'pan') {
-        this.canvas.isDragging = true;
+        this.isPanning = true;
         this.canvas.selection = false;
         this.lastPan = p;
         this.canvas.defaultCursor = 'grabbing';
@@ -246,7 +252,7 @@ export class EditorCanvas {
         this.strokePoints.push(p);
         const path = (this.currentPath.path as unknown[][]) ?? [];
         path.push(['L', p.x, p.y]);
-        this.currentPath.set({ path: path as fabric.Point[] });
+        this.currentPath.set({ path: path as unknown as fabric.Point[] });
         this.render();
       } else if (this.drawing && this.currentRect && this.startPoint) {
         const w = Math.abs(p.x - this.startPoint.x);
@@ -272,7 +278,7 @@ export class EditorCanvas {
         this.strokePoints.push(p);
         this.currentPolyline.set({ points: this.strokePoints.map((pt) => ({ x: pt.x, y: pt.y })) });
         this.render();
-      } else if (this.canvas.isDragging && this.lastPan) {
+      } else if (this.isPanning && this.lastPan) {
         const vpt = this.canvas.viewportTransform;
         if (!vpt) return;
         vpt[4] += p.x - this.lastPan.x;
@@ -293,8 +299,8 @@ export class EditorCanvas {
         this.currentPolyline = null;
         this.cb.onStrokeEnd?.();
       }
-      if (this.canvas.isDragging) {
-        this.canvas.isDragging = false;
+      if (this.isPanning) {
+        this.isPanning = false;
         this.canvas.defaultCursor = 'grab';
       }
     });
@@ -342,10 +348,12 @@ export class EditorCanvas {
     this.drawLayer.add(obj);
   }
 
-  private toImagePoint(e: MouseEvent | WheelEvent): Point {
+  private toImagePoint(e: fabric.TPointerEvent): Point {
     const rect = this.host.getBoundingClientRect();
-    const x = (e.clientX - rect.left - (this.canvas.viewportTransform?.[4] ?? 0)) / (this.canvas.getZoom() || 1);
-    const y = (e.clientY - rect.top - (this.canvas.viewportTransform?.[5] ?? 0)) / (this.canvas.getZoom() || 1);
+    const cx = 'clientX' in e ? e.clientX : (e as TouchEvent).touches[0]?.clientX ?? 0;
+    const cy = 'clientY' in e ? e.clientY : (e as TouchEvent).touches[0]?.clientY ?? 0;
+    const x = (cx - rect.left - (this.canvas.viewportTransform?.[4] ?? 0)) / (this.canvas.getZoom() || 1);
+    const y = (cy - rect.top - (this.canvas.viewportTransform?.[5] ?? 0)) / (this.canvas.getZoom() || 1);
     return { x, y };
   }
 

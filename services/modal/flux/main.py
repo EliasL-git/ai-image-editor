@@ -51,6 +51,19 @@ def download_flux() -> None:
     )
 
 
+def download_flux_schnell() -> None:
+    """Ensure the FLUX.1-schnell (text-to-image) weights are cached on the volume."""
+    import os
+
+    os.makedirs("/models/hf", exist_ok=True)
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        "black-forest-labs/FLUX.1-schnell",
+        local_dir="/models/hf/FLUX.1-schnell",
+    )
+
+
 @app.cls(
     image=FLUX_IMAGE,
     gpu="A100-40GB",
@@ -145,6 +158,7 @@ class FluxKontext:
 @app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
 def _warm() -> None:
     download_flux()
+    download_flux_schnell()
 
 
 @app.local_entrypoint()
@@ -168,3 +182,63 @@ def web_edit(payload: dict) -> dict:
         )
     except Exception as e:
         _http_error(e, "FLUX edit failed")
+
+
+@app.cls(
+    image=FLUX_IMAGE,
+    gpu="A100-40GB",
+    timeout=900,
+    volumes={"/models": volume},
+    secrets=[modal.Secret.from_name("hf-token")],
+)
+# A container is recycled (terminated) after a single generation, so it never
+# lingers after a job finishes or fails.
+@modal.concurrent(max_inputs=1)
+class FluxGenerate:
+    @modal.enter()
+    def load(self) -> None:
+        import torch
+        from diffusers import FluxPipeline
+
+        print("[flux] loading FLUX.1-schnell…")
+        self._pipe = FluxPipeline.from_pretrained(
+            "/models/hf/FLUX.1-schnell",
+            torch_dtype=torch.bfloat16,
+        ).to("cuda")
+        print("[flux] schnell loaded")
+
+    @modal.method()
+    def generate(self, prompt: str, seed: Optional[int] = None) -> dict:
+        import time
+
+        import torch
+
+        started = time.time()
+        gen = torch.Generator(device="cuda").manual_seed(seed if seed is not None else int(time.time()))
+
+        result = self._pipe(
+            prompt=prompt,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=gen,
+            output_type="pil",
+        ).images[0]
+
+        png = image_to_png_bytes(result.convert("RGB"))
+        return {
+            "imageUrl": encode_data_url(png),
+            "width": result.width,
+            "height": result.height,
+            "latencyMs": int((time.time() - started) * 1000),
+        }
+
+
+@app.function(image=FLUX_IMAGE, volumes={"/models": volume}, secrets=[modal.Secret.from_name("hf-token")])
+@modal.fastapi_endpoint(method="POST")
+def web_generate(payload: dict) -> dict:
+    """HTTP endpoint used by the Express API: POST /generate (JSON body)"""
+    try:
+        svc = FluxGenerate()
+        return svc.generate.remote(prompt=payload["prompt"], seed=payload.get("seed"))
+    except Exception as e:
+        _http_error(e, "FLUX generate failed")

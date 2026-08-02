@@ -96,6 +96,7 @@ export const api = {
   // jobs
   segment: (input: SegmentJobInput) => request<JobResponse>('/segment', { method: 'POST', body: JSON.stringify(input) }),
   edit: (input: EditJobInput) => request<JobResponse>('/edit', { method: 'POST', body: JSON.stringify(input) }),
+  generate: (input: { prompt: string; seed?: number }) => request<JobResponse>('/generate', { method: 'POST', body: JSON.stringify(input) }),
   job: (id: string) => request<{ job: Job }>(`/jobs/${id}`),
 
   // projects

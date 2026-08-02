@@ -13,38 +13,74 @@ body,
 }
 
 body {
-  @apply bg-ink-950 text-zinc-100 antialiased;
-  font-family: 'Inter', system-ui, sans-serif;
+  @apply bg-background text-on-surface antialiased;
+  font-family: 'Geist', system-ui, sans-serif;
+  overflow: hidden;
 }
 
 @layer components {
-  .btn-ghost {
-    @apply inline-flex items-center gap-1.5 rounded-lg border border-ink-700 bg-ink-850 px-2.5 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-accent/60 hover:text-white disabled:opacity-50;
+  /* Material Symbols Outlined */
+  .ms {
+    font-family: 'Material Symbols Outlined';
+    font-weight: normal;
+    font-style: normal;
+    display: inline-block;
+    line-height: 1;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
+    word-wrap: normal;
+    direction: ltr;
+    font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
+    font-size: 20px;
+    user-select: none;
   }
+
   .tool-btn {
-    @apply flex h-10 w-10 items-center justify-center rounded-lg border border-transparent text-zinc-400 transition hover:border-ink-600 hover:bg-ink-800 hover:text-white disabled:opacity-40;
+    @apply flex h-10 w-10 items-center justify-center rounded-lg border border-transparent text-on-surface-variant transition hover:bg-surface-container-high hover:text-on-surface;
+  }
+  .tool-btn.active {
+    @apply border-l-2 border-primary bg-surface-container-highest text-primary;
+    box-shadow: 0 0 15px rgba(255, 255, 255, 0.05);
   }
 }
 
-/* Checkerboard backdrop for transparent canvases */
-.checkerboard {
-  background-image:
-    linear-gradient(45deg, #1e1e24 25%, transparent 25%),
-    linear-gradient(-45deg, #1e1e24 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #1e1e24 75%),
-    linear-gradient(-45deg, transparent 75%, #1e1e24 75%);
-  background-size: 20px 20px;
-  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
-  background-color: #26262e;
+/* Dotted canvas backdrop */
+.canvas-bg {
+  background-color: #0e0e10;
+  background-image: radial-gradient(#201f22 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Sliders */
+.slider-thumb::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 12px;
+  width: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.1);
 }
 
 /* Scrollbars */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #131315;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #353437;
+  border-radius: 4px;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2d2d3c;
+  background: #353437;
   border-radius: 8px;
 }
 ::-webkit-scrollbar-track {
@@ -63,17 +99,4 @@ body {
 }
 .animate-fade-in {
   animation: fadeIn 0.25s ease-out;
-}
-
-@keyframes pulseGlow {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.35);
-  }
-  50% {
-    box-shadow: 0 0 22px 4px rgba(34, 211, 238, 0.35);
-  }
-}
-.animate-pulse-glow {
-  animation: pulseGlow 1.8s ease-in-out infinite;
 }
